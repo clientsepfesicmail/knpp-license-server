@@ -1,1 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>KNPP License Admin</title>
+<style>
+  :root {
+    --bg:#f0f4fb; --card:#fff; --primary:#2f66b4; --success:#2e8b57;
+    --danger:#c0392b; --warn:#d35400; --border:#d0daf0; --text:#1b3558;
+    --muted:#6b7f9e; --sidebar:#1a3a7a;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
 
+  /* Login */
+  #login-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;}
+  .login-card{background:var(--card);border-radius:14px;padding:40px 36px;width:360px;
+    box-shadow:0 4px 24px rgba(30,60,120,.13);border:1px solid var(--border);}
+  .login-card h2{color:var(--primary);font-size:22px;margin-bottom:6px;}
+  .login-card p{color:var(--muted);font-size:13px;margin-bottom:22px;}
+
+  /* Layout */
+  #main-app{display:none;min-height:100vh;}
+  .layout{display:flex;min-height:100vh;}
+  .sidebar{width:240px;background:var(--sidebar);padding:20px 14px;display:flex;flex-direction:column;gap:4px;flex-shrink:0;}
+  .sidebar .brand{color:#fff;font-size:17px;font-weight:800;padding:10px 8px 20px;border-bottom:1px solid rgba(255,255,255,.15);margin-bottom:10px;}
+  .sidebar .brand span{display:block;font-size:11px;font-weight:400;color:#a0b8e0;margin-top:3px;}
+  .nav-btn{background:transparent;border:none;color:rgba(255,255,255,.82);padding:11px 14px;
+    border-radius:9px;cursor:pointer;font-size:14px;font-weight:600;text-align:left;width:100%;transition:.15s;}
+  .nav-btn:hover{background:rgba(255,255,255,.14);color:#fff;}
+  .nav-btn.active{background:#fff;color:var(--sidebar);font-weight:800;}
+  .content{flex:1;padding:24px;overflow-y:auto;}
+
+  /* Cards */
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:18px;}
+  .card-title{font-size:16px;font-weight:800;color:var(--primary);margin-bottom:16px;display:flex;align-items:center;gap:8px;}
+
+  /* Stats */
+  .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px;}
+  .stat{border-radius:12px;padding:18px 20px;color:#fff;}
+  .stat .num{font-size:40px;font-weight:900;line-height:1;}
+  .stat .lbl{font-size:12px;font-weight:600;opacity:.88;margin-top:4px;}
+
+  /* Form */
+  .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
+  .form-row.three{grid-template-columns:1fr 1fr 1fr;}
+  .form-group{display:flex;flex-direction:column;gap:5px;}
+  .form-group label{font-size:12px;font-weight:700;color:var(--muted);}
+  input,select,textarea{padding:9px 12px;border:1.5px solid var(--border);border-radius:8px;
+    font-size:13px;color:var(--text);background:#fff;outline:none;width:100%;}
+  input:focus,select:focus{border-color:var(--primary);}
+
+  /* Buttons */
+  .btn{padding:9px 20px;border:none;border-radius:8px;font-weight:800;font-size:13px;cursor:pointer;transition:.15s;}
+  .btn-primary{background:var(--primary);color:#fff;}
+  .btn-primary:hover{background:#3f79ca;}
+  .btn-success{background:var(--success);color:#fff;}
+  .btn-success:hover{background:#38a368;}
+  .btn-danger{background:var(--danger);color:#fff;}
+  .btn-danger:hover{background:#e04030;}
+  .btn-warn{background:var(--warn);color:#fff;}
+  .btn-warn:hover{background:#e8641a;}
+  .btn-outline{background:#fff;color:var(--primary);border:2px solid var(--primary);}
+  .btn-outline:hover{background:var(--primary);color:#fff;}
+  .btn-sm{padding:5px 12px;font-size:12px;}
+
+  /* Table */
+  .tbl-wrap{overflow-x:auto;}
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th{background:#dfe6f1;color:#22487f;font-weight:900;padding:10px 10px;text-align:left;
+    border-bottom:2px solid var(--border);}
+  td{padding:9px 10px;border-bottom:1px solid #eef2f8;vertical-align:middle;}
+  tr:hover td{background:#f5f8ff;}
+
+  /* Badge */
+  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;}
+  .badge-active{background:#dcfce7;color:#166534;}
+  .badge-expiring{background:#fef3c7;color:#92400e;}
+  .badge-expired{background:#fee2e2;color:#991b1b;}
+  .badge-revoked{background:#f3f4f6;color:#374151;}
+
+  /* Modal */
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100;
+    align-items:center;justify-content:center;}
+  .modal-overlay.open{display:flex;}
+  .modal{background:#fff;border-radius:14px;padding:28px 28px 22px;width:480px;max-width:95vw;
+    box-shadow:0 8px 40px rgba(0,0,0,.18);}
+  .modal h3{font-size:16px;font-weight:800;color:var(--primary);margin-bottom:16px;}
+
+  /* Key display */
+  .key-box{background:#1a1a2e;color:#00ff88;font-family:monospace;font-size:18px;font-weight:800;
+    padding:14px 18px;border-radius:8px;letter-spacing:2px;text-align:center;margin:12px 0;
+    user-select:all;cursor:pointer;border:2px solid #00ff88;}
+  .key-box:hover{background:#0d1117;}
+
+  /* Alert */
+  .alert{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px;font-weight:600;}
+  .alert-success{background:#dcfce7;color:#166534;border:1px solid #bbf7d0;}
+  .alert-error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;}
+  .alert-warn{background:#fef3c7;color:#92400e;border:1px solid #fde68a;}
+
+  /* Search */
+  .search-bar{display:flex;gap:10px;margin-bottom:14px;align-items:center;}
+  .search-bar input{max-width:280px;}
+
+  /* Responsive hide */
+  @media(max-width:640px){
+    .form-row,.form-row.three{grid-template-columns:1fr;}
+    .sidebar{width:200px;}
+  }
+
+  .page{display:none;}
+  .page.active{display:block;}
+  .spinner{display:inline-block;width:18px;height:18px;border:3px solid rgba(255,255,255,.3);
+    border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-card">
+    <h2>🔐 KNPP License Admin</h2>
+    <p>EPF & ESIC Compliance Manager — License Management</p>
+    <div class="form-group" style="margin-bottom:14px;">
+      <label>ADMIN PASSWORD</label>
+      <input type="password" id="login-pw" placeholder="Enter admin password" onkeydown="if(event.key==='Enter')doLogin()"/>
+    </div>
+    <div id="login-err" class="alert alert-error" style="display:none;"></div>
+    <button class="btn btn-primary" style="width:100%;min-height:42px;" onclick="doLogin()">Login →</button>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="main-app">
+  <div class="layout">
+
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+      <div class="brand">⚙ KNPP Admin<span>License Management</span></div>
+      <button class="nav-btn active" onclick="showPage('dashboard',this)">📊  Dashboard</button>
+      <button class="nav-btn" onclick="showPage('licenses',this)">🗂  All Licenses</button>
+      <button class="nav-btn" onclick="showPage('generate',this)">➕  Generate Key</button>
+      <button class="nav-btn" onclick="showPage('expiring',this)">⚠️  Expiring Soon</button>
+      <div style="flex:1;"></div>
+      <button class="nav-btn" onclick="doLogout()" style="color:#ff9999;">⏻  Logout</button>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="content">
+
+      <!-- DASHBOARD PAGE -->
+      <div class="page active" id="page-dashboard">
+        <h2 style="margin-bottom:18px;color:var(--primary);">📊 Dashboard</h2>
+        <div class="stats-grid">
+          <div class="stat" style="background:#2f66b4;">
+            <div class="num" id="stat-total">—</div>
+            <div class="lbl">Total Licenses</div>
+          </div>
+          <div class="stat" style="background:#2e8b57;">
+            <div class="num" id="stat-active">—</div>
+            <div class="lbl">Active</div>
+          </div>
+          <div class="stat" style="background:#d35400;">
+            <div class="num" id="stat-expiring">—</div>
+            <div class="lbl">Expiring in 30 Days</div>
+          </div>
+          <div class="stat" style="background:#c0392b;">
+            <div class="num" id="stat-expired">—</div>
+            <div class="lbl">Expired</div>
+          </div>
+          <div class="stat" style="background:#16818a;">
+            <div class="num" id="stat-pcs">—</div>
+            <div class="lbl">PCs Activated</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">⚠️ Expiring in Next 30 Days</div>
+          <div id="dash-expiring-list">Loading...</div>
+        </div>
+      </div>
+
+      <!-- ALL LICENSES PAGE -->
+      <div class="page" id="page-licenses">
+        <h2 style="margin-bottom:18px;color:var(--primary);">🗂 All Licenses</h2>
+        <div class="search-bar">
+          <input type="text" id="lic-search" placeholder="Search by client name or key..." oninput="filterLicenses()"/>
+          <button class="btn btn-outline btn-sm" onclick="loadLicenses()">🔄 Refresh</button>
+        </div>
+        <div class="card" style="padding:0;">
+          <div class="tbl-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>License Key</th>
+                  <th>Client</th>
+                  <th>Phone</th>
+                  <th>PCs</th>
+                  <th>Activated</th>
+                  <th>Expires</th>
+                  <th>Days Left</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="lic-tbody">
+                <tr><td colspan="9" style="text-align:center;padding:20px;color:var(--muted);">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- GENERATE KEY PAGE -->
+      <div class="page" id="page-generate">
+        <h2 style="margin-bottom:18px;color:var(--primary);">➕ Generate New License Key</h2>
+        <div class="card" style="max-width:560px;">
+          <div class="card-title">📋 Client Details</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>CLIENT / FIRM NAME *</label>
+              <input type="text" id="gen-name" placeholder="ABC & Associates"/>
+            </div>
+            <div class="form-group">
+              <label>PHONE NUMBER</label>
+              <input type="text" id="gen-phone" placeholder="9876543210"/>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>EMAIL (optional)</label>
+              <input type="email" id="gen-email" placeholder="abc@gmail.com"/>
+            </div>
+            <div class="form-group">
+              <label>MAX PCs ALLOWED</label>
+              <select id="gen-maxpcs">
+                <option value="1">1 PC</option>
+                <option value="2">2 PCs</option>
+                <option value="3" selected>3 PCs (Standard)</option>
+                <option value="5">5 PCs (Premium)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group" style="margin-bottom:14px;">
+            <label>NOTES (internal)</label>
+            <input type="text" id="gen-notes" placeholder="e.g. Referred by XYZ, Guwahati client"/>
+          </div>
+          <div id="gen-alert" style="display:none;"></div>
+          <button class="btn btn-success" style="min-height:44px;width:100%;" onclick="generateKey()">
+            🔑 Generate License Key
+          </button>
+        </div>
+      </div>
+
+      <!-- EXPIRING SOON PAGE -->
+      <div class="page" id="page-expiring">
+        <h2 style="margin-bottom:18px;color:var(--primary);">⚠️ Expiring Soon</h2>
+        <div class="card" style="padding:0;">
+          <div class="tbl-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Client</th>
+                  <th>Phone</th>
+                  <th>License Key</th>
+                  <th>Expires On</th>
+                  <th>Days Left</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="exp-tbody">
+                <tr><td colspan="6" style="text-align:center;padding:20px;color:var(--muted);">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- content -->
+  </div><!-- layout -->
+</div><!-- main-app -->
+
+<!-- MODAL: License Detail / Machines -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal" style="width:560px;">
+    <h3>🔍 License Details</h3>
+    <div id="detail-content"></div>
+    <div style="text-align:right;margin-top:16px;">
+      <button class="btn btn-outline" onclick="closeModal('detail-modal')">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: Generated Key -->
+<div class="modal-overlay" id="key-modal">
+  <div class="modal" style="text-align:center;">
+    <h3>✅ License Key Generated!</h3>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:8px;">Click the key to copy it</p>
+    <div class="key-box" id="generated-key-display" onclick="copyKey()">—</div>
+    <p id="key-client-name" style="font-weight:700;color:var(--success);font-size:14px;margin:8px 0;"></p>
+    <p id="key-expires" style="color:var(--muted);font-size:13px;margin-bottom:16px;"></p>
+    <div style="display:flex;gap:10px;justify-content:center;">
+      <button class="btn btn-success" onclick="copyKey()">📋 Copy Key</button>
+      <button class="btn btn-outline" onclick="closeModal('key-modal');loadLicenses();">Done</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "";   // Same origin — Flask serves this HTML
+let TOKEN = "";
+let ALL_LICENSES = [];
+
+// ── Auth ──────────────────────────────────────────────────────
+async function doLogin() {
+  const pw = document.getElementById('login-pw').value.trim();
+  if (!pw) return;
+  const res = await fetch(`${API}/admin/login`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({password: pw})
+  });
+  const data = await res.json();
+  if (data.success) {
+    TOKEN = data.token;
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('main-app').style.display = 'block';
+    loadDashboard();
+    loadLicenses();
+    loadExpiring();
+  } else {
+    const el = document.getElementById('login-err');
+    el.textContent = '❌ ' + data.message;
+    el.style.display = 'block';
+  }
+}
+
+function doLogout() {
+  TOKEN = "";
+  document.getElementById('main-app').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('login-pw').value = '';
+}
+
+function authHeaders() {
+  return {'Content-Type':'application/json','X-Admin-Token': TOKEN};
+}
+
+// ── Navigation ────────────────────────────────────────────────
+function showPage(name, btn) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  btn.classList.add('active');
+}
+
+// ── Dashboard ─────────────────────────────────────────────────
+async function loadDashboard() {
+  const res  = await fetch(`${API}/admin/dashboard`, {headers: authHeaders()});
+  const data = await res.json();
+  if (!data.success) return;
+  document.getElementById('stat-total').textContent    = data.total;
+  document.getElementById('stat-active').textContent   = data.active;
+  document.getElementById('stat-expiring').textContent = data.expiring_soon;
+  document.getElementById('stat-expired').textContent  = data.expired;
+  document.getElementById('stat-pcs').textContent      = data.total_pcs_activated;
+
+  // Expiring list on dashboard
+  const res2  = await fetch(`${API}/admin/licenses`, {headers: authHeaders()});
+  const data2 = await res2.json();
+  const expiring = (data2.licenses || []).filter(l => l.days_left >= 0 && l.days_left < 30);
+  const el = document.getElementById('dash-expiring-list');
+  if (expiring.length === 0) {
+    el.innerHTML = '<p style="color:var(--success);font-weight:700;">✅ No licenses expiring in next 30 days.</p>';
+    return;
+  }
+  el.innerHTML = expiring.map(l => `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);">
+      <div>
+        <strong>${l.client_name}</strong>
+        <span style="color:var(--muted);font-size:12px;margin-left:8px;">${l.key}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="badge badge-expiring">⏳ ${l.days_left} days left</span>
+        <button class="btn btn-success btn-sm" onclick="renewKey('${l.key}')">Renew</button>
+      </div>
+    </div>`).join('');
+}
+
+// ── All Licenses ──────────────────────────────────────────────
+async function loadLicenses() {
+  const res  = await fetch(`${API}/admin/licenses`, {headers: authHeaders()});
+  const data = await res.json();
+  ALL_LICENSES = data.licenses || [];
+  renderLicenses(ALL_LICENSES);
+}
+
+function renderLicenses(licenses) {
+  const tbody = document.getElementById('lic-tbody');
+  if (licenses.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:20px;color:var(--muted);">No licenses found.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = licenses.map(l => {
+    const badge = l.display_status === 'active'
+      ? `<span class="badge badge-active">Active</span>`
+      : l.display_status === 'expiring_soon'
+      ? `<span class="badge badge-expiring">Expiring Soon</span>`
+      : l.display_status === 'expired'
+      ? `<span class="badge badge-expired">Expired</span>`
+      : `<span class="badge badge-revoked">Revoked</span>`;
+    const days = l.days_left < 0 ? `<span style="color:var(--danger);font-weight:700;">Expired</span>`
+               : l.days_left < 30 ? `<span style="color:var(--warn);font-weight:700;">${l.days_left}d</span>`
+               : `<span style="color:var(--success);">${l.days_left}d</span>`;
+    const pcs  = (l.machines || []).length;
+    return `<tr>
+      <td style="font-family:monospace;font-size:12px;font-weight:700;color:var(--primary);">${l.key}</td>
+      <td><strong>${l.client_name}</strong></td>
+      <td>${l.client_phone || '—'}</td>
+      <td><span style="font-weight:800;">${pcs}</span> / ${l.max_pcs}</td>
+      <td style="font-size:12px;">${l.activated_on || '—'}</td>
+      <td style="font-size:12px;">${l.expires_on || '—'}</td>
+      <td>${days}</td>
+      <td>${badge}</td>
+      <td>
+        <div style="display:flex;gap:5px;flex-wrap:wrap;">
+          <button class="btn btn-outline btn-sm" onclick="showDetail(${JSON.stringify(l).replace(/"/g,'&quot;')})">Details</button>
+          <button class="btn btn-success btn-sm" onclick="renewKey('${l.key}')">Renew</button>
+          <button class="btn btn-danger btn-sm" onclick="revokeKey('${l.key}')">Revoke</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function filterLicenses() {
+  const q = document.getElementById('lic-search').value.toLowerCase();
+  const filtered = ALL_LICENSES.filter(l =>
+    l.client_name.toLowerCase().includes(q) || l.key.toLowerCase().includes(q)
+  );
+  renderLicenses(filtered);
+}
+
+// ── Expiring Soon ─────────────────────────────────────────────
+async function loadExpiring() {
+  const res  = await fetch(`${API}/admin/licenses`, {headers: authHeaders()});
+  const data = await res.json();
+  const expiring = (data.licenses || []).filter(l => l.days_left >= 0 && l.days_left < 30);
+  const tbody = document.getElementById('exp-tbody');
+  if (expiring.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--success);font-weight:700;">✅ No licenses expiring soon.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = expiring.map(l => `<tr>
+    <td><strong>${l.client_name}</strong></td>
+    <td>${l.client_phone || '—'}</td>
+    <td style="font-family:monospace;font-size:12px;">${l.key}</td>
+    <td>${l.expires_on}</td>
+    <td><span class="badge badge-expiring">⏳ ${l.days_left} days</span></td>
+    <td><button class="btn btn-success btn-sm" onclick="renewKey('${l.key}')">💰 Renew (+1 Year)</button></td>
+  </tr>`).join('');
+}
+
+// ── Generate Key ──────────────────────────────────────────────
+async function generateKey() {
+  const name  = document.getElementById('gen-name').value.trim();
+  const phone = document.getElementById('gen-phone').value.trim();
+  const email = document.getElementById('gen-email').value.trim();
+  const maxpcs = parseInt(document.getElementById('gen-maxpcs').value);
+  const notes = document.getElementById('gen-notes').value.trim();
+  const alertEl = document.getElementById('gen-alert');
+
+  if (!name) {
+    alertEl.className = 'alert alert-error';
+    alertEl.textContent = '❌ Client name is required.';
+    alertEl.style.display = 'block'; return;
+  }
+  alertEl.style.display = 'none';
+
+  const res  = await fetch(`${API}/admin/generate`, {
+    method:'POST', headers: authHeaders(),
+    body: JSON.stringify({client_name:name, client_phone:phone,
+                          client_email:email, max_pcs:maxpcs, notes:notes})
+  });
+  const data = await res.json();
+  if (data.success) {
+    document.getElementById('generated-key-display').textContent = data.key;
+    document.getElementById('key-client-name').textContent = `Licensed to: ${name}`;
+    document.getElementById('key-expires').textContent = `Valid till: ${data.expires_on}`;
+    openModal('key-modal');
+    // Clear form
+    ['gen-name','gen-phone','gen-email','gen-notes'].forEach(id =>
+      document.getElementById(id).value = '');
+    loadDashboard();
+    loadExpiring();
+  } else {
+    alertEl.className = 'alert alert-error';
+    alertEl.textContent = '❌ ' + data.message;
+    alertEl.style.display = 'block';
+  }
+}
+
+function copyKey() {
+  const key = document.getElementById('generated-key-display').textContent;
+  navigator.clipboard.writeText(key).then(() => {
+    const el = document.getElementById('generated-key-display');
+    const orig = el.textContent;
+    el.textContent = '✅ Copied!';
+    setTimeout(() => el.textContent = orig, 1500);
+  });
+}
+
+// ── Renew ─────────────────────────────────────────────────────
+async function renewKey(key) {
+  if (!confirm(`Renew license:\n${key}\n\n+1 Year will be added. Confirm?`)) return;
+  const res  = await fetch(`${API}/admin/renew`, {
+    method:'POST', headers: authHeaders(), body: JSON.stringify({key})
+  });
+  const data = await res.json();
+  if (data.success) {
+    alert(`✅ Renewed!\nNew expiry: ${data.new_expires}`);
+    loadLicenses(); loadDashboard(); loadExpiring();
+  } else {
+    alert('❌ ' + data.message);
+  }
+}
+
+// ── Revoke ────────────────────────────────────────────────────
+async function revokeKey(key) {
+  if (!confirm(`⚠️ REVOKE license:\n${key}\n\nThis will immediately disable the app for this client.\nAre you sure?`)) return;
+  const res  = await fetch(`${API}/admin/revoke_license`, {
+    method:'POST', headers: authHeaders(), body: JSON.stringify({key})
+  });
+  const data = await res.json();
+  if (data.success) { alert('✅ License revoked.'); loadLicenses(); loadDashboard(); }
+  else alert('❌ ' + data.message);
+}
+
+// ── Detail Modal ──────────────────────────────────────────────
+function showDetail(lic) {
+  const machines = lic.machines || [];
+  document.getElementById('detail-content').innerHTML = `
+    <div style="margin-bottom:12px;">
+      <strong style="font-size:15px;">${lic.client_name}</strong>
+      ${lic.client_phone ? `<span style="color:var(--muted);font-size:13px;margin-left:8px;">📱 ${lic.client_phone}</span>` : ''}
+    </div>
+    <div style="font-family:monospace;background:#f0f4fb;padding:10px;border-radius:8px;font-weight:700;
+      font-size:14px;letter-spacing:1px;margin-bottom:14px;color:var(--primary);">${lic.key}</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;margin-bottom:14px;">
+      <div>📅 Activated: <strong>${lic.activated_on || '—'}</strong></div>
+      <div>⏳ Expires: <strong>${lic.expires_on || '—'}</strong></div>
+      <div>💻 Max PCs: <strong>${lic.max_pcs}</strong></div>
+      <div>🔢 Used PCs: <strong>${machines.length}</strong></div>
+    </div>
+    <div style="font-weight:800;margin-bottom:8px;color:var(--primary);">💻 Activated Machines:</div>
+    ${machines.length === 0
+      ? '<p style="color:var(--muted);font-size:13px;">No machines activated yet.</p>'
+      : machines.map(m => `
+        <div style="display:flex;justify-content:space-between;align-items:center;
+          padding:8px 12px;background:#f5f8ff;border-radius:8px;margin-bottom:6px;border:1px solid var(--border);">
+          <div>
+            <strong>${m.label || 'Unknown PC'}</strong>
+            <span style="color:var(--muted);font-size:11px;display:block;font-family:monospace;">${m.id}</span>
+            <span style="color:var(--muted);font-size:11px;">Activated: ${m.activated_on || '—'}</span>
+          </div>
+          <button class="btn btn-danger btn-sm" onclick="removeMachine('${lic.key}','${m.id}')">Remove</button>
+        </div>`).join('')
+    }
+    ${lic.notes ? `<div style="margin-top:12px;font-size:12px;color:var(--muted);">📝 Notes: ${lic.notes}</div>` : ''}
+  `;
+  openModal('detail-modal');
+}
+
+async function removeMachine(key, machineId) {
+  if (!confirm('Remove this machine from the license?\nClient can then activate on a new PC.')) return;
+  const res  = await fetch(`${API}/admin/revoke_machine`, {
+    method:'POST', headers: authHeaders(),
+    body: JSON.stringify({key, machine_id: machineId})
+  });
+  const data = await res.json();
+  if (data.success) {
+    alert('✅ Machine removed. Client can now activate on a new PC.');
+    closeModal('detail-modal');
+    loadLicenses();
+  } else {
+    alert('❌ ' + data.message);
+  }
+}
+
+// ── Modal helpers ─────────────────────────────────────────────
+function openModal(id)  { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+document.querySelectorAll('.modal-overlay').forEach(m =>
+  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); })
+);
+
+// ── Enter key on login ────────────────────────────────────────
+document.getElementById('login-pw').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+</script>
+</body>
+</html>
