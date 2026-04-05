@@ -1,68 +1,52 @@
-"""
-KNPP Associate — Multi-Product License Server
-Version 2.0
-
-Endpoints:
-  POST /activate              — Activate a license key on a machine
-  POST /verify                — Verify license for a machine
-  POST /admin/login           — Admin authenticate
-  POST /admin/generate        — Admin generate new license key
-  GET  /admin/licenses        — Admin list licenses (optional ?product=...)
-  GET  /admin/dashboard       — Admin summary counts
-  POST /admin/renew           — Admin renew a key by 1 year
-  POST /admin/revoke_machine  — Admin remove one machine from a key
-"""
-
-import os
-import hmac
 import hashlib
+import hmac
+import os
 import secrets
 import string
-from datetime import datetime, timedelta, date
+from datetime import date, datetime, timedelta
+from typing import Any
 
-from flask import Flask, request, jsonify, send_from_directory
-from supabase import create_client, Client
+from flask import Flask, jsonify, request, send_from_directory
+from supabase import Client, create_client
 
 app = Flask(__name__, static_folder="admin", static_url_path="")
 
-# ── Environment / Config ───────────────────────────────────────
-SUPABASE_URL   = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "knpp@admin2024")
-SERVER_SECRET  = os.environ.get("SERVER_SECRET", "knpp_secret_key_change_this")
+SERVER_SECRET = os.environ.get("SERVER_SECRET", "knpp_secret_key_change_this")
+BRAND_NAME = "Tezhisab"
+LICENSE_PREFIX = "PPPM"
+DEFAULT_PRODUCT_CODE = "EEM"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Product Master ─────────────────────────────────────────────
-VALID_PRODUCTS = {
-    "EPF_ESIC": "EPF & ESIC Manager",
-    "TALLYSYNC_PRO": "TallySync Pro",
-    "APP3": "App 3",
-    "APP4": "App 4",
-    "APP5": "App 5",
-    "APP6": "App 6",
-    "APP7": "App 7",
-}
+DEFAULT_PRODUCTS = [
+    {
+        "product_name": "TallySync Pro",
+        "product_code": "TSP",
+        "prefix_code": "TSP",
+        "default_limit": 3,
+        "status": "active",
+        "sort_order": 1,
+    },
+    {
+        "product_name": "EPF & ESIC Manager",
+        "product_code": "EEM",
+        "prefix_code": "EEM",
+        "default_limit": 3,
+        "status": "active",
+        "sort_order": 2,
+    },
+]
 
-PRODUCT_PREFIX = {
-    "EPF_ESIC": "EPF",
-    "TALLYSYNC_PRO": "TSP",
-    "APP3": "A03",
-    "APP4": "A04",
-    "APP5": "A05",
-    "APP6": "A06",
-    "APP7": "A07",
-}
 
-DEFAULT_PRODUCT = "EPF_ESIC"
-
-# ── Helpers ────────────────────────────────────────────────────
 def today_str() -> str:
     return date.today().isoformat()
 
 
-def days_from_today(d_str: str) -> int:
-    """Return days remaining from today to d_str (negative = expired)."""
+
+def days_from_today(d_str: str | None) -> int:
     if not d_str:
         return 9999
     try:
@@ -72,60 +56,130 @@ def days_from_today(d_str: str) -> int:
         return 0
 
 
-def normalize_product(product: str | None) -> str:
-    p = (product or "").strip().upper()
-    if not p:
-        return DEFAULT_PRODUCT
-    return p
+
+def check_admin(req) -> bool:
+    return req.headers.get("X-Admin-Token", "") == ADMIN_PASSWORD
 
 
-def is_valid_product(product: str) -> bool:
-    return product in VALID_PRODUCTS
+
+def slug_code(value: str) -> str:
+    cleaned = "".join(ch for ch in value.upper().strip() if ch.isalnum())
+    return cleaned[:8]
 
 
-def generate_key(product: str) -> str:
-    """Generate a product-wise license key."""
-    year = datetime.now().year
-    part1 = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    part2 = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    prefix = PRODUCT_PREFIX.get(product, "GEN")
-    raw = f"KNPP-{prefix}-{year}-{part1}-{part2}"
-    chk = hmac.new(SERVER_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()[:4].upper()
-    return f"{raw}-{chk}"
+
+def make_checksum(raw: str) -> str:
+    return hmac.new(SERVER_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()[:4].upper()
+
 
 
 def verify_key_format(key: str) -> bool:
-    """Verify checksum of license key."""
     parts = key.strip().upper().split("-")
     if len(parts) != 6:
         return False
     raw = "-".join(parts[:5])
-    expected_chk = hmac.new(SERVER_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()[:4].upper()
-    return parts[5] == expected_chk
+    return parts[5] == make_checksum(raw)
+
 
 
 def make_signature(key: str, machine_id: str, expires: str) -> str:
-    """Create tamper-proof signature for local cache."""
-    data = f"{key}|{machine_id}|{expires}|{SERVER_SECRET}"
-    return hashlib.sha256(data.encode()).hexdigest()[:32]
+    payload = f"{key}|{machine_id}|{expires}|{SERVER_SECRET}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
-def check_admin(req) -> bool:
-    token = req.headers.get("X-Admin-Token", "")
-    return token == ADMIN_PASSWORD
+
+def _safe_table_select(table: str, *cols: str, order_by: str | None = None):
+    query = supabase.table(table).select(",".join(cols) if cols else "*")
+    if order_by:
+        query = query.order(order_by)
+    return query.execute()
 
 
-def get_license_by_key(key: str):
+
+def fetch_products() -> list[dict[str, Any]]:
+    try:
+        resp = _safe_table_select("products", "*", order_by="sort_order")
+        rows = resp.data or []
+    except Exception:
+        rows = []
+    if rows:
+        normalized = []
+        for row in rows:
+            code = slug_code(row.get("product_code") or row.get("code") or row.get("prefix_code") or "")
+            if not code:
+                continue
+            normalized.append(
+                {
+                    "id": row.get("id"),
+                    "product_name": row.get("product_name") or row.get("name") or code,
+                    "product_code": code,
+                    "prefix_code": slug_code(row.get("prefix_code") or code) or code,
+                    "default_limit": int(row.get("default_limit") or 3),
+                    "status": (row.get("status") or "active").lower(),
+                    "sort_order": int(row.get("sort_order") or 999),
+                }
+            )
+        normalized.sort(key=lambda x: (x.get("sort_order", 999), x["product_name"]))
+        return normalized
+    return DEFAULT_PRODUCTS.copy()
+
+
+
+def get_product_map(include_inactive: bool = True) -> dict[str, dict[str, Any]]:
+    products = fetch_products()
+    if not include_inactive:
+        products = [p for p in products if p.get("status") == "active"]
+    return {p["product_code"]: p for p in products}
+
+
+
+def normalize_product(product: str | None) -> str:
+    code = slug_code(product or "")
+    return code or DEFAULT_PRODUCT_CODE
+
+
+
+def generate_key(product_code: str) -> str:
+    product_map = get_product_map(include_inactive=True)
+    product = product_map.get(product_code)
+    prefix = (product or {}).get("prefix_code") or product_code or "GEN"
+    year = datetime.now().year
+    part1 = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    part2 = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    raw = f"{LICENSE_PREFIX}-{prefix}-{year}-{part1}-{part2}"
+    return f"{raw}-{make_checksum(raw)}"
+
+
+
+def enrich_license(lic: dict[str, Any], product_map: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    product_map = product_map or get_product_map(include_inactive=True)
+    code = normalize_product(lic.get("product") or lic.get("product_code"))
+    product = product_map.get(code, {"product_name": code, "product_code": code, "default_limit": 3})
+    days_left = days_from_today(lic.get("expires_on"))
+    display_status = "active"
+    if days_left < 0:
+        display_status = "expired"
+    elif days_left <= 30:
+        display_status = "expiring_soon"
+    enriched = dict(lic)
+    enriched["product"] = code
+    enriched["product_code"] = code
+    enriched["product_name"] = product.get("product_name", code)
+    enriched["default_limit"] = int(product.get("default_limit") or 3)
+    enriched["days_left"] = days_left
+    enriched["display_status"] = display_status
+    enriched["used_pcs"] = len(enriched.get("machines") or [])
+    return enriched
+
+
+
+def get_license_by_key(key: str) -> dict[str, Any] | None:
     resp = supabase.table("licenses").select("*").eq("key", key).execute()
     if not resp.data:
         return None
-    lic = resp.data[0]
-    if not lic.get("product"):
-        lic["product"] = DEFAULT_PRODUCT
-    return lic
+    return enrich_license(resp.data[0])
 
 
-# ── Routes ─────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory("admin", "index.html")
@@ -135,72 +189,104 @@ def index():
 def admin_login():
     data = request.json or {}
     if data.get("password") == ADMIN_PASSWORD:
-        return jsonify({"success": True, "token": ADMIN_PASSWORD})
+        return jsonify({"success": True, "token": ADMIN_PASSWORD, "brand": BRAND_NAME})
     return jsonify({"success": False, "message": "Invalid password"}), 401
+
+
+@app.route("/admin/products", methods=["GET"])
+def admin_products():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    return jsonify({"success": True, "products": fetch_products(), "brand": BRAND_NAME, "license_prefix": LICENSE_PREFIX})
+
+
+@app.route("/admin/products", methods=["POST"])
+def admin_add_product():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    data = request.json or {}
+    product_name = (data.get("product_name") or "").strip()
+    product_code = slug_code(data.get("product_code") or "")
+    prefix_code = slug_code(data.get("prefix_code") or product_code)
+    status = (data.get("status") or "active").lower()
+    default_limit = int(data.get("default_limit") or 3)
+    if not product_name or not product_code:
+        return jsonify({"success": False, "message": "Product name and code are required."}), 400
+    existing = get_product_map(include_inactive=True)
+    if product_code in existing:
+        return jsonify({"success": False, "message": "Product code already exists."}), 400
+    payload = {
+        "product_name": product_name,
+        "product_code": product_code,
+        "prefix_code": prefix_code or product_code,
+        "default_limit": default_limit,
+        "status": status,
+        "sort_order": int(data.get("sort_order") or (len(existing) + 1)),
+    }
+    try:
+        supabase.table("products").insert(payload).execute()
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": "Could not save product. Create a 'products' table in Supabase with columns: product_name, product_code, prefix_code, default_limit, status, sort_order.",
+            "error": str(e),
+        }), 500
+    return jsonify({"success": True, "message": "Product added successfully.", "product": payload})
+
+
+@app.route("/admin/products/<product_code>", methods=["PUT"])
+def admin_update_product(product_code: str):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    code = slug_code(product_code)
+    data = request.json or {}
+    payload = {}
+    if "product_name" in data:
+        payload["product_name"] = (data.get("product_name") or "").strip()
+    if "prefix_code" in data:
+        payload["prefix_code"] = slug_code(data.get("prefix_code") or code) or code
+    if "default_limit" in data:
+        payload["default_limit"] = int(data.get("default_limit") or 3)
+    if "status" in data:
+        payload["status"] = (data.get("status") or "active").lower()
+    if not payload:
+        return jsonify({"success": False, "message": "No changes provided."}), 400
+    try:
+        supabase.table("products").update(payload).eq("product_code", code).execute()
+    except Exception as e:
+        return jsonify({"success": False, "message": "Could not update product.", "error": str(e)}), 500
+    return jsonify({"success": True, "message": "Product updated successfully."})
 
 
 @app.route("/activate", methods=["POST"])
 def activate():
-    """
-    Body:
-    {
-      "key": "KNPP-...",
-      "machine_id": "...",
-      "machine_label": "PC Name",
-      "product": "EPF_ESIC"
-    }
-    """
     data = request.json or {}
+    key = (data.get("key") or "").strip().upper()
+    machine_id = (data.get("machine_id") or "").strip()
+    machine_label = (data.get("machine_label") or "Unknown PC").strip()
+    product_code = normalize_product(data.get("product"))
+    product_map = get_product_map(include_inactive=True)
 
-    key = data.get("key", "").strip().upper()
-    machine_id = data.get("machine_id", "").strip()
-    machine_label = data.get("machine_label", "Unknown PC")
-    product = normalize_product(data.get("product"))
-
-    if not key or not machine_id or not product:
-        return jsonify({
-            "success": False,
-            "message": "Key, Machine ID and Product are required."
-        }), 400
-
-    if not is_valid_product(product):
-        return jsonify({
-            "success": False,
-            "message": f"Invalid product: {product}"
-        }), 400
-
+    if not key or not machine_id:
+        return jsonify({"success": False, "message": "Key and Machine ID are required."}), 400
+    if product_code not in product_map:
+        return jsonify({"success": False, "message": f"Invalid product: {product_code}"}), 400
     if not verify_key_format(key):
-        return jsonify({
-            "success": False,
-            "message": "Invalid license key format."
-        }), 400
+        return jsonify({"success": False, "message": "Invalid license key format."}), 400
 
     lic = get_license_by_key(key)
     if not lic:
-        return jsonify({
-            "success": False,
-            "message": "License key not found."
-        }), 404
+        return jsonify({"success": False, "message": "License key not found."}), 404
+    if lic["product_code"] != product_code:
+        return jsonify({"success": False, "message": f"This license is not valid for product: {product_code}"}), 403
 
-    lic_product = normalize_product(lic.get("product"))
-    if lic_product != product:
-        return jsonify({
-            "success": False,
-            "message": f"This license is not valid for product: {product}"
-        }), 403
-
-    days_left = days_from_today(lic.get("expires_on", ""))
+    days_left = lic["days_left"]
     if days_left < 0:
-        return jsonify({
-            "success": False,
-            "message": f"This license expired on {lic.get('expires_on')}.\nPlease renew. Contact: Pradip Majumder — 7896489317"
-        }), 403
+        return jsonify({"success": False, "message": f"This license expired on {lic.get('expires_on')}. Please renew."}), 403
 
-    machines = lic.get("machines", []) or []
-    max_pcs = int(lic.get("max_pcs", 3) or 3)
-
+    machines = lic.get("machines") or []
+    max_pcs = int(lic.get("max_pcs") or lic.get("default_limit") or 3)
     existing_ids = [m.get("id") for m in machines]
-
     if machine_id in existing_ids:
         sig = make_signature(key, machine_id, lic.get("expires_on", ""))
         return jsonify({
@@ -209,28 +295,14 @@ def activate():
             "expires": lic.get("expires_on", ""),
             "client_name": lic.get("client_name", ""),
             "days_left": days_left,
-            "product": lic_product,
-            "signature": sig
+            "product": product_code,
+            "signature": sig,
         })
-
     if len(machines) >= max_pcs:
-        return jsonify({
-            "success": False,
-            "message": f"Maximum {max_pcs} PC limit reached for this license.\nPlease contact Pradip Majumder — 7896489317 to add more PCs."
-        }), 403
+        return jsonify({"success": False, "message": f"Maximum {max_pcs} PC limit reached for this license."}), 403
 
-    machines.append({
-        "id": machine_id,
-        "label": machine_label,
-        "activated_on": today_str()
-    })
-
-    supabase.table("licenses").update({
-        "machines": machines,
-        "last_verified": today_str(),
-        "product": lic_product
-    }).eq("key", key).execute()
-
+    machines.append({"id": machine_id, "label": machine_label, "activated_on": today_str()})
+    supabase.table("licenses").update({"machines": machines, "last_verified": today_str(), "product": product_code}).eq("key", key).execute()
     sig = make_signature(key, machine_id, lic.get("expires_on", ""))
     return jsonify({
         "success": True,
@@ -238,122 +310,70 @@ def activate():
         "expires": lic.get("expires_on", ""),
         "client_name": lic.get("client_name", ""),
         "days_left": days_left,
-        "product": lic_product,
-        "signature": sig
+        "product": product_code,
+        "signature": sig,
     })
 
 
 @app.route("/verify", methods=["POST"])
 def verify():
-    """
-    Body:
-    {
-      "key": "KNPP-...",
-      "machine_id": "...",
-      "product": "EPF_ESIC"
-    }
-    """
     data = request.json or {}
+    key = (data.get("key") or "").strip().upper()
+    machine_id = (data.get("machine_id") or "").strip()
+    product_code = normalize_product(data.get("product"))
+    product_map = get_product_map(include_inactive=True)
 
-    key = data.get("key", "").strip().upper()
-    machine_id = data.get("machine_id", "").strip()
-    product = normalize_product(data.get("product"))
-
-    if not key or not machine_id or not product:
-        return jsonify({
-            "valid": False,
-            "message": "Missing key, machine ID or product."
-        }), 400
-
-    if not is_valid_product(product):
-        return jsonify({
-            "valid": False,
-            "message": f"Invalid product: {product}"
-        }), 400
+    if not key or not machine_id:
+        return jsonify({"valid": False, "message": "Missing key or machine ID."}), 400
+    if product_code not in product_map:
+        return jsonify({"valid": False, "message": f"Invalid product: {product_code}"}), 400
 
     lic = get_license_by_key(key)
     if not lic:
-        return jsonify({
-            "valid": False,
-            "message": "License key not found."
-        }), 404
+        return jsonify({"valid": False, "message": "License key not found."}), 404
+    if lic["product_code"] != product_code:
+        return jsonify({"valid": False, "message": f"This license is not valid for product: {product_code}"}), 403
 
-    lic_product = normalize_product(lic.get("product"))
-    if lic_product != product:
-        return jsonify({
-            "valid": False,
-            "message": f"This license is not valid for product: {product}"
-        }), 403
+    machines = lic.get("machines") or []
+    if machine_id not in [m.get("id") for m in machines]:
+        return jsonify({"valid": False, "message": "This machine is not registered for this license. Please activate first."}), 403
+    if lic["days_left"] < 0:
+        return jsonify({"valid": False, "message": f"License expired on {lic.get('expires_on')}. Please renew.", "expires": lic.get("expires_on"), "days_left": lic["days_left"]}), 403
 
-    machines = lic.get("machines", []) or []
-    machine_ids = [m.get("id") for m in machines]
-
-    if machine_id not in machine_ids:
-        return jsonify({
-            "valid": False,
-            "message": "This machine is not registered for this license.\nPlease activate first or contact KNPP."
-        }), 403
-
-    days_left = days_from_today(lic.get("expires_on", ""))
-    if days_left < 0:
-        return jsonify({
-            "valid": False,
-            "message": f"License expired on {lic.get('expires_on')}.\nPlease renew. Contact: Pradip Majumder — 7896489317",
-            "expires": lic.get("expires_on", ""),
-            "days_left": days_left
-        }), 403
-
-    supabase.table("licenses").update({
-        "last_verified": today_str(),
-        "product": lic_product
-    }).eq("key", key).execute()
-
-    sig = make_signature(key, machine_id, lic.get("expires_on", ""))
+    supabase.table("licenses").update({"last_verified": today_str(), "product": product_code}).eq("key", key).execute()
     return jsonify({
         "valid": True,
         "expires": lic.get("expires_on", ""),
         "client_name": lic.get("client_name", ""),
-        "product": lic_product,
-        "days_left": days_left,
-        "signature": sig,
-        "message": "License valid."
+        "product": product_code,
+        "days_left": lic["days_left"],
+        "signature": make_signature(key, machine_id, lic.get("expires_on", "")),
+        "message": "License valid.",
     })
 
 
-# ── Admin endpoints ────────────────────────────────────────────
 @app.route("/admin/generate", methods=["POST"])
 def admin_generate():
     if not check_admin(request):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
-
     data = request.json or {}
-
-    client_name = data.get("client_name", "").strip()
-    client_phone = data.get("client_phone", "").strip()
-    client_email = data.get("client_email", "").strip()
-    max_pcs = int(data.get("max_pcs", 3))
-    notes = data.get("notes", "")
-    product = normalize_product(data.get("product"))
-
+    client_name = (data.get("client_name") or "").strip()
+    client_phone = (data.get("client_phone") or "").strip()
+    client_email = (data.get("client_email") or "").strip()
+    notes = (data.get("notes") or "").strip()
+    product_code = normalize_product(data.get("product"))
+    product_map = get_product_map(include_inactive=True)
     if not client_name:
-        return jsonify({
-            "success": False,
-            "message": "Client name required."
-        }), 400
-
-    if not is_valid_product(product):
-        return jsonify({
-            "success": False,
-            "message": f"Invalid product: {product}"
-        }), 400
-
-    key = generate_key(product)
+        return jsonify({"success": False, "message": "Client name required."}), 400
+    if product_code not in product_map:
+        return jsonify({"success": False, "message": f"Invalid product: {product_code}"}), 400
+    max_pcs = int(data.get("max_pcs") or product_map[product_code].get("default_limit") or 3)
+    key = generate_key(product_code)
     activated_on = today_str()
     expires_on = (date.today() + timedelta(days=365)).isoformat()
-
     supabase.table("licenses").insert({
         "key": key,
-        "product": product,
+        "product": product_code,
         "client_name": client_name,
         "client_phone": client_phone,
         "client_email": client_email,
@@ -363,16 +383,15 @@ def admin_generate():
         "expires_on": expires_on,
         "last_verified": None,
         "status": "active",
-        "notes": notes
+        "notes": notes,
     }).execute()
-
     return jsonify({
         "success": True,
         "key": key,
-        "product": product,
-        "product_name": VALID_PRODUCTS.get(product, product),
+        "product": product_code,
+        "product_name": product_map[product_code]["product_name"],
         "expires_on": expires_on,
-        "message": f"License generated for {client_name}"
+        "message": f"License generated for {client_name}",
     })
 
 
@@ -380,68 +399,54 @@ def admin_generate():
 def admin_licenses():
     if not check_admin(request):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
-
-    product = normalize_product(request.args.get("product", "")).strip()
-    raw_product = (request.args.get("product", "") or "").strip().upper()
-
-    query = supabase.table("licenses").select("*")
-    if raw_product and is_valid_product(raw_product):
-        query = query.eq("product", raw_product)
-
-    resp = query.order("activated_on", desc=True).execute()
-
-    licenses = []
-    for lic in (resp.data or []):
-        lic_product = normalize_product(lic.get("product"))
-        days_left = days_from_today(lic.get("expires_on", ""))
-
-        lic["product"] = lic_product
-        lic["product_name"] = VALID_PRODUCTS.get(lic_product, lic_product)
-        lic["days_left"] = days_left
-
-        if days_left < 0:
-            lic["display_status"] = "expired"
-        elif days_left <= 30:
-            lic["display_status"] = "expiring_soon"
-        else:
-            lic["display_status"] = "active"
-
-        licenses.append(lic)
-
-    return jsonify({
-        "success": True,
-        "licenses": licenses
-    })
+    raw_product = normalize_product(request.args.get("product")) if request.args.get("product") else ""
+    try:
+        query = supabase.table("licenses").select("*")
+        if raw_product:
+            query = query.eq("product", raw_product)
+        resp = query.order("activated_on", desc=True).execute()
+        licenses = [enrich_license(row) for row in (resp.data or [])]
+    except Exception as e:
+        return jsonify({"success": False, "message": "Failed to fetch licenses.", "error": str(e)}), 500
+    return jsonify({"success": True, "licenses": licenses})
 
 
 @app.route("/admin/dashboard", methods=["GET"])
 def admin_dashboard():
     if not check_admin(request):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
-
     resp = supabase.table("licenses").select("*").execute()
-    data = resp.data or []
-
-    total = len(data)
-    active = sum(1 for l in data if days_from_today(l.get("expires_on", "")) >= 30)
-    expiring_soon = sum(1 for l in data if 0 <= days_from_today(l.get("expires_on", "")) < 30)
-    expired = sum(1 for l in data if days_from_today(l.get("expires_on", "")) < 0)
-    total_pcs = sum(len(l.get("machines", []) or []) for l in data)
-
-    product_counts = {}
-    for code in VALID_PRODUCTS:
-        product_counts[code] = sum(
-            1 for l in data if normalize_product(l.get("product")) == code
-        )
-
+    licenses = [enrich_license(row) for row in (resp.data or [])]
+    products = fetch_products()
+    total = len(licenses)
+    active = sum(1 for l in licenses if l["display_status"] == "active")
+    expiring = sum(1 for l in licenses if l["display_status"] == "expiring_soon")
+    expired = sum(1 for l in licenses if l["display_status"] == "expired")
+    total_pcs = sum(l["used_pcs"] for l in licenses)
+    product_summaries = []
+    for product in products:
+        product_licenses = [l for l in licenses if l["product_code"] == product["product_code"]]
+        product_summaries.append({
+            "product_code": product["product_code"],
+            "product_name": product["product_name"],
+            "active": sum(1 for l in product_licenses if l["display_status"] == "active"),
+            "expiring": sum(1 for l in product_licenses if l["display_status"] == "expiring_soon"),
+            "expired": sum(1 for l in product_licenses if l["display_status"] == "expired"),
+            "total": len(product_licenses),
+            "used_pcs": sum(l["used_pcs"] for l in product_licenses),
+        })
+    expiring_list = sorted([l for l in licenses if 0 <= l["days_left"] <= 30], key=lambda x: x["days_left"])[:12]
     return jsonify({
         "success": True,
+        "brand": BRAND_NAME,
+        "license_prefix": LICENSE_PREFIX,
         "total": total,
         "active": active,
-        "expiring_soon": expiring_soon,
+        "expiring_soon": expiring,
         "expired": expired,
         "total_pcs_activated": total_pcs,
-        "product_counts": product_counts
+        "product_summaries": product_summaries,
+        "expiring_list": expiring_list,
     })
 
 
@@ -449,87 +454,39 @@ def admin_dashboard():
 def admin_renew():
     if not check_admin(request):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
-
-    data = request.json or {}
-    key = data.get("key", "").strip().upper()
-
+    key = (request.json or {}).get("key", "").strip().upper()
     if not key:
-        return jsonify({
-            "success": False,
-            "message": "Key required."
-        }), 400
-
+        return jsonify({"success": False, "message": "Key required."}), 400
     lic = get_license_by_key(key)
     if not lic:
-        return jsonify({
-            "success": False,
-            "message": "Key not found."
-        }), 404
-
-    current_exp = lic.get("expires_on", today_str())
+        return jsonify({"success": False, "message": "Key not found."}), 404
     try:
-        base = date.fromisoformat(current_exp)
+        base = date.fromisoformat(lic.get("expires_on") or today_str())
         if base < date.today():
             base = date.today()
     except Exception:
         base = date.today()
-
     new_expires = (base + timedelta(days=365)).isoformat()
-
-    supabase.table("licenses").update({
-        "expires_on": new_expires,
-        "status": "active"
-    }).eq("key", key).execute()
-
-    return jsonify({
-        "success": True,
-        "message": f"Renewed! New expiry: {new_expires}",
-        "new_expires": new_expires
-    })
+    supabase.table("licenses").update({"expires_on": new_expires, "status": "active"}).eq("key", key).execute()
+    return jsonify({"success": True, "message": f"Renewed! New expiry: {new_expires}", "new_expires": new_expires})
 
 
 @app.route("/admin/revoke_machine", methods=["POST"])
 def admin_revoke_machine():
     if not check_admin(request):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
-
     data = request.json or {}
-    key = data.get("key", "").strip().upper()
-    machine_id = data.get("machine_id", "").strip()
-
+    key = (data.get("key") or "").strip().upper()
+    machine_id = (data.get("machine_id") or "").strip()
     if not key or not machine_id:
-        return jsonify({
-            "success": False,
-            "message": "Key and machine_id required."
-        }), 400
-
+        return jsonify({"success": False, "message": "Key and machine_id required."}), 400
     lic = get_license_by_key(key)
     if not lic:
-        return jsonify({
-            "success": False,
-            "message": "Key not found."
-        }), 404
-
-    machines = [m for m in (lic.get("machines", []) or []) if m.get("id") != machine_id]
-
-    supabase.table("licenses").update({
-        "machines": machines
-    }).eq("key", key).execute()
-
-    return jsonify({
-        "success": True,
-        "message": "Machine removed. Client can now activate on a new PC."
-    })
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "success": True,
-        "message": "License server is running."
-    })
+        return jsonify({"success": False, "message": "Key not found."}), 404
+    machines = [m for m in (lic.get("machines") or []) if m.get("id") != machine_id]
+    supabase.table("licenses").update({"machines": machines}).eq("key", key).execute()
+    return jsonify({"success": True, "message": "Machine removed successfully."})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
