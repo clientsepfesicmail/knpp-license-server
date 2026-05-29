@@ -309,7 +309,7 @@ tr:hover td{background:#fbfdff}
           <div class="card-title">Product List</div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Name</th><th>Code</th><th>Prefix</th><th>Default Limit</th><th>Status</th><th>Action</th></tr></thead>
+              <thead><tr><th>Name</th><th>Code</th><th>Prefix</th><th>Default Limit</th><th>Status</th><th>Actions</th></tr></thead>
               <tbody id="products-tbody"><tr><td colspan="6" class="muted">Loading...</td></tr></tbody>
             </table>
           </div>
@@ -392,8 +392,29 @@ function renderProductsTable(){
     <td>${p.prefix_code}</td>
     <td>${p.default_limit}</td>
     <td>${p.status==='active' ? '<span class="badge badge-active">Active</span>' : '<span class="badge badge-expired">Inactive</span>'}</td>
-    <td><button class="btn btn-outline btn-sm" onclick="toggleProductStatus('${p.product_code}','${p.status==='active' ? 'inactive' : 'active'}')">${p.status==='active' ? 'Disable' : 'Enable'}</button></td>
+    <td style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-outline btn-sm" onclick="toggleProductStatus('${p.product_code}','${p.status==='active' ? 'inactive' : 'active'}')">${p.status==='active' ? 'Disable' : 'Enable'}</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteProduct('${p.product_code}','${(p.product_name || '').replace(/'/g, "\\'")}')">Delete</button>
+    </td>
   </tr>`).join('');
+}
+
+
+async function deleteProduct(code, name){
+  const label = name || code;
+  if(!confirm(`Delete product "${label}"?\n\nUse this only for test/unwanted products. Existing real products should be disabled, not deleted.`)) return;
+  try{
+    let data = await safeFetchJson(`${API}/admin/products/${encodeURIComponent(code)}`, {method:'DELETE', headers:authHeaders()});
+    if(data.requires_force){
+      if(!confirm(`${data.message}\n\nDo you also want to delete all license records of this product?`)) return;
+      data = await safeFetchJson(`${API}/admin/products/${encodeURIComponent(code)}?force=true`, {method:'DELETE', headers:authHeaders()});
+    }
+    if(!data.success) return alert(data.message || 'Failed to delete product');
+    alert(data.message || 'Product deleted successfully.');
+    await loadProducts();
+    await loadLicenses();
+    await loadDashboard();
+  }catch(e){ alert('Failed to delete product'); }
 }
 
 async function toggleProductStatus(code, status){
