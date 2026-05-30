@@ -1,8 +1,11 @@
+import base64
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import string
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -15,6 +18,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "knpp@admin2024")
 SERVER_SECRET = os.environ.get("SERVER_SECRET", "knpp_secret_key_change_this")
+ADMIN_EMAILS = {email.strip().lower() for email in os.environ.get("ADMIN_EMAILS", "capinkupatowary@gmail.com,prodip252@gmail.com").split(",") if email.strip()}
+SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "24"))
 BRAND_NAME = "Tezhisab"
 LICENSE_PREFIX = "PPPM"
 DEFAULT_PRODUCT_CODE = "EEM"
@@ -37,6 +42,22 @@ DEFAULT_PRODUCTS = [
         "default_limit": 3,
         "status": "active",
         "sort_order": 2,
+    },
+    {
+        "product_name": "Bank Import Pro",
+        "product_code": "BIP",
+        "prefix_code": "BIP",
+        "default_limit": 3,
+        "status": "active",
+        "sort_order": 3,
+    },
+    {
+        "product_name": "TezHisab Prime / Invoice Management",
+        "product_code": "THP",
+        "prefix_code": "THP",
+        "default_limit": 3,
+        "status": "active",
+        "sort_order": 4,
     },
     {
         "product_name": "EDU PRIME",
@@ -65,8 +86,90 @@ def days_from_today(d_str: str | None) -> int:
 
 
 
+def _normalize_email(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    iterations = 210_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), iterations).hex()
+    return f"pbkdf2_sha256${iterations}${salt}${digest}"
+
+
+def _verify_password(password: str, stored: str | None) -> bool:
+    try:
+        algorithm, iterations, salt, expected = (stored or "").split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), int(iterations)).hex()
+        return hmac.compare_digest(digest, expected)
+    except Exception:
+        return False
+
+
+def _b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _b64decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _issue_token(user: dict[str, Any]) -> str:
+    payload = {
+        "email": _normalize_email(user.get("email")),
+        "role": (user.get("role") or "customer").lower(),
+        "customer_id": user.get("customer_id"),
+        "name": user.get("display_name") or user.get("email") or "User",
+        "exp": int(time.time()) + (SESSION_HOURS * 3600),
+    }
+    body = _b64encode(json.dumps(payload, separators=(",", ":")).encode())
+    signature = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+    return f"{body}.{signature}"
+
+
+def _read_token(token: str | None) -> dict[str, Any] | None:
+    try:
+        body, signature = (token or "").split(".", 1)
+        expected = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(signature, expected):
+            return None
+        payload = json.loads(_b64decode(body).decode())
+        if int(payload.get("exp") or 0) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _current_user(req) -> dict[str, Any] | None:
+    header = req.headers.get("Authorization", "")
+    if header.lower().startswith("bearer "):
+        return _read_token(header.split(" ", 1)[1].strip())
+    return None
+
+
 def check_admin(req) -> bool:
-    return req.headers.get("X-Admin-Token", "") == ADMIN_PASSWORD
+    # Keep the old dashboard working during migration. New portal uses signed bearer tokens.
+    if req.headers.get("X-Admin-Token", "") == ADMIN_PASSWORD:
+        return True
+    user = _current_user(req)
+    return bool(user and user.get("role") == "admin" and _normalize_email(user.get("email")) in ADMIN_EMAILS)
+
+
+def _write_log(action: str, details: dict[str, Any] | None = None, req=None) -> None:
+    try:
+        user = _current_user(req) if req is not None else None
+        supabase.table("activity_logs").insert({
+            "actor_email": (user or {}).get("email") or "system",
+            "actor_role": (user or {}).get("role") or "system",
+            "action": action,
+            "details": details or {},
+        }).execute()
+    except Exception:
+        # Logging must never interrupt licensing.
+        pass
 
 
 
@@ -129,6 +232,9 @@ def _normalize_product_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "default_limit": _int_or_default(row.get("default_limit"), 3),
         "status": (row.get("status") or "active").lower(),
         "sort_order": _int_or_default(row.get("sort_order"), 999),
+        "description": (row.get("description") or "").strip(),
+        "auto_update_required": bool(row.get("auto_update_required", True)),
+        "customer_portal_visible": bool(row.get("customer_portal_visible", True)),
     }
 
 
@@ -219,7 +325,9 @@ def enrich_license(lic: dict[str, Any], product_map: dict[str, dict[str, Any]] |
     product = product_map.get(code, {"product_name": code, "product_code": code, "default_limit": 3})
     days_left = days_from_today(lic.get("expires_on"))
     display_status = "active"
-    if days_left < 0:
+    if (lic.get("status") or "active").lower() == "suspended":
+        display_status = "suspended"
+    elif days_left < 0:
         display_status = "expired"
     elif days_left <= 30:
         display_status = "expiring_soon"
@@ -244,6 +352,17 @@ def get_license_by_key(key: str) -> dict[str, Any] | None:
 
 @app.route("/")
 def index():
+    return send_from_directory("admin", "portal.html")
+
+
+@app.route("/portal")
+@app.route("/portal/")
+def portal():
+    return send_from_directory("admin", "portal.html")
+
+
+@app.route("/legacy-admin")
+def legacy_admin():
     return send_from_directory("admin", "index.html")
 
 
@@ -411,6 +530,8 @@ def activate():
         return jsonify({"success": False, "message": "License key not found."}), 404
     if lic["product_code"] != product_code:
         return jsonify({"success": False, "message": f"This license is not valid for product: {product_code}"}), 403
+    if (lic.get("status") or "active").lower() not in ("active", "trial"):
+        return jsonify({"success": False, "message": "This license is suspended. Please contact Tezhisab support."}), 403
 
     days_left = lic["days_left"]
     if days_left < 0:
@@ -465,6 +586,8 @@ def verify():
         return jsonify({"valid": False, "message": "License key not found."}), 404
     if lic["product_code"] != product_code:
         return jsonify({"valid": False, "message": f"This license is not valid for product: {product_code}"}), 403
+    if (lic.get("status") or "active").lower() not in ("active", "trial"):
+        return jsonify({"valid": False, "message": "This license is suspended. Please contact Tezhisab support."}), 403
 
     machines = lic.get("machines") or []
     if machine_id not in [m.get("id") for m in machines]:
@@ -619,6 +742,280 @@ def admin_revoke_machine():
     machines = [m for m in (lic.get("machines") or []) if m.get("id") != machine_id]
     supabase.table("licenses").update({"machines": machines}).eq("key", key).execute()
     return jsonify({"success": True, "message": "Machine removed successfully."})
+
+
+# ---------------------------------------------------------------------------
+# Tezhisab Central Portal — Phase 1
+# Email-based admin/customer login, customer master, software master and
+# update metadata manager. Existing desktop app activation APIs remain intact.
+# ---------------------------------------------------------------------------
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data = request.json or {}
+    email = _normalize_email(data.get("email"))
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"success": False, "message": "Email and password are required."}), 400
+    try:
+        resp = supabase.table("portal_users").select("*").eq("email", email).limit(1).execute()
+        user = (resp.data or [None])[0]
+    except Exception as e:
+        return jsonify({"success": False, "message": "Run TEZHISAB_CENTRAL_PORTAL_SETUP.sql in Supabase SQL Editor first.", "error": str(e)}), 500
+
+    # First-login bootstrap for the two approved administrators. Both use the
+    # Render ADMIN_PASSWORD initially and can change it from Portal Settings.
+    if not user and email in ADMIN_EMAILS and hmac.compare_digest(password, ADMIN_PASSWORD):
+        user = {
+            "email": email,
+            "password_hash": _hash_password(password),
+            "role": "admin",
+            "display_name": email.split("@", 1)[0].replace(".", " ").title(),
+            "status": "active",
+            "customer_id": None,
+        }
+        supabase.table("portal_users").upsert(user, on_conflict="email").execute()
+    if not user or (user.get("status") or "active") != "active" or not _verify_password(password, user.get("password_hash")):
+        return jsonify({"success": False, "message": "Invalid email or password."}), 401
+    token = _issue_token(user)
+    _write_log("portal_login", {"email": email, "role": user.get("role")}, request)
+    return jsonify({"success": True, "token": token, "user": {"email": email, "role": user.get("role"), "name": user.get("display_name"), "customer_id": user.get("customer_id")}})
+
+
+@app.route("/auth/me", methods=["GET"])
+def auth_me():
+    user = _current_user(request)
+    if not user:
+        return jsonify({"success": False, "message": "Login required."}), 401
+    return jsonify({"success": True, "user": user})
+
+
+@app.route("/auth/change-password", methods=["POST"])
+def auth_change_password():
+    auth = _current_user(request)
+    if not auth:
+        return jsonify({"success": False, "message": "Login required."}), 401
+    data = request.json or {}
+    old_password = data.get("old_password") or ""
+    new_password = data.get("new_password") or ""
+    if len(new_password) < 8:
+        return jsonify({"success": False, "message": "New password must contain at least 8 characters."}), 400
+    email = _normalize_email(auth.get("email"))
+    resp = supabase.table("portal_users").select("*").eq("email", email).limit(1).execute()
+    user = (resp.data or [None])[0]
+    if not user or not _verify_password(old_password, user.get("password_hash")):
+        return jsonify({"success": False, "message": "Current password is incorrect."}), 403
+    supabase.table("portal_users").update({"password_hash": _hash_password(new_password)}).eq("email", email).execute()
+    _write_log("password_changed", {"email": email}, request)
+    return jsonify({"success": True, "message": "Password changed successfully."})
+
+
+def _require_admin_json():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "Admin login required."}), 401
+    return None
+
+
+@app.route("/admin/customers", methods=["GET"])
+def admin_customers_list():
+    denied = _require_admin_json()
+    if denied: return denied
+    resp = supabase.table("customers").select("*").order("created_at", desc=True).execute()
+    return jsonify({"success": True, "customers": resp.data or []})
+
+
+@app.route("/admin/customers", methods=["POST"])
+def admin_customers_add():
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    email = _normalize_email(data.get("email"))
+    password = data.get("password") or ""
+    phone = (data.get("phone") or "").strip()
+    business_name = (data.get("business_name") or "").strip()
+    if not name or not email or len(password) < 8:
+        return jsonify({"success": False, "message": "Name, email and an initial password of at least 8 characters are required."}), 400
+    try:
+        customer_payload = {"name": name, "email": email, "phone": phone, "business_name": business_name, "status": "active"}
+        customer_resp = supabase.table("customers").insert(customer_payload).execute()
+        customer = (customer_resp.data or [None])[0]
+        if not customer:
+            customer = (supabase.table("customers").select("*").eq("email", email).limit(1).execute().data or [None])[0]
+        user_payload = {"email": email, "password_hash": _hash_password(password), "role": "customer", "display_name": name, "customer_id": customer.get("id") if customer else None, "status": "active"}
+        supabase.table("portal_users").upsert(user_payload, on_conflict="email").execute()
+        _write_log("customer_created", {"email": email, "name": name}, request)
+        return jsonify({"success": True, "message": "Customer account created successfully.", "customer": customer})
+    except Exception as e:
+        return jsonify({"success": False, "message": "Could not create customer. The email may already exist.", "error": str(e)}), 400
+
+
+@app.route("/admin/customers/<int:customer_id>/reset-password", methods=["POST"])
+def admin_customer_reset_password(customer_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    new_password = data.get("password") or ""
+    if len(new_password) < 8:
+        return jsonify({"success": False, "message": "Password must contain at least 8 characters."}), 400
+    customer = (supabase.table("customers").select("*").eq("id", customer_id).limit(1).execute().data or [None])[0]
+    if not customer:
+        return jsonify({"success": False, "message": "Customer not found."}), 404
+    supabase.table("portal_users").update({"password_hash": _hash_password(new_password)}).eq("email", _normalize_email(customer.get("email"))).execute()
+    _write_log("customer_password_reset", {"customer_id": customer_id, "email": customer.get("email")}, request)
+    return jsonify({"success": True, "message": "Customer password reset successfully."})
+
+
+@app.route("/admin/software", methods=["GET"])
+def admin_software_list():
+    denied = _require_admin_json()
+    if denied: return denied
+    products = fetch_products()
+    try:
+        channels = supabase.table("update_channels").select("*").order("product_code").execute().data or []
+    except Exception:
+        channels = []
+    for product in products:
+        product["channels"] = [c for c in channels if slug_code(c.get("product_code") or "") == product["product_code"]]
+    return jsonify({"success": True, "products": products})
+
+
+@app.route("/admin/software", methods=["POST"])
+def admin_software_add():
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    product_name = (data.get("product_name") or "").strip()
+    product_code = slug_code(data.get("product_code") or product_name)
+    prefix_code = slug_code(data.get("prefix_code") or product_code)
+    description = (data.get("description") or "").strip()
+    default_limit = _int_or_default(data.get("default_limit"), 3)
+    channel_codes = data.get("channels") or ["WINDOWS_EXE"]
+    if not product_name or not product_code:
+        return jsonify({"success": False, "message": "Software name and product code are required."}), 400
+    if product_code in get_product_map(include_inactive=True):
+        return jsonify({"success": False, "message": "Product code already exists."}), 400
+    payload = {"product_name": product_name, "product_code": product_code, "prefix_code": prefix_code or product_code, "default_limit": default_limit, "status": "active", "sort_order": len(fetch_products()) + 1, "description": description, "auto_update_required": bool(data.get("auto_update_required", True)), "customer_portal_visible": bool(data.get("customer_portal_visible", True))}
+    try:
+        supabase.table("products").insert(payload).execute()
+        for channel_code in channel_codes:
+            ccode = slug_code(channel_code) or "WINDOWS"
+            label = {"WINDOWSEXE":"Windows Desktop — EXE", "ANDROIDAPK":"Android Mobile — APK", "WEBAPP":"Web App"}.get(ccode, channel_code.replace("_", " ").title())
+            supabase.table("update_channels").insert({"product_code": product_code, "channel_code": ccode, "channel_name": label, "platform": ccode, "status": "active"}).execute()
+        _write_log("software_created", {"product_code": product_code, "product_name": product_name, "channels": channel_codes}, request)
+        return jsonify({"success": True, "message": "Software created successfully.", "product": payload})
+    except Exception as e:
+        return jsonify({"success": False, "message": "Could not create software. Run the latest SQL setup first.", "error": str(e)}), 500
+
+
+@app.route("/admin/update-channels", methods=["GET"])
+def admin_update_channels_list():
+    denied = _require_admin_json()
+    if denied: return denied
+    resp = supabase.table("update_channels").select("*").order("product_code").execute()
+    return jsonify({"success": True, "channels": resp.data or []})
+
+
+@app.route("/admin/update-channels", methods=["POST"])
+def admin_update_channels_add():
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    product_code = normalize_product(data.get("product_code"))
+    channel_code = slug_code(data.get("channel_code") or "WINDOWS_EXE")
+    channel_name = (data.get("channel_name") or channel_code).strip()
+    if not find_product(product_code, include_inactive=True):
+        return jsonify({"success": False, "message": "Create the software product first."}), 400
+    payload = {"product_code": product_code, "channel_code": channel_code, "channel_name": channel_name, "platform": (data.get("platform") or channel_code), "repo_owner": (data.get("repo_owner") or "").strip(), "repo_name": (data.get("repo_name") or "").strip(), "manifest_url": (data.get("manifest_url") or "").strip(), "status": "active"}
+    supabase.table("update_channels").upsert(payload, on_conflict="product_code,channel_code").execute()
+    _write_log("update_channel_saved", payload, request)
+    return jsonify({"success": True, "message": "Update channel saved successfully.", "channel": payload})
+
+
+@app.route("/admin/versions", methods=["GET"])
+def admin_versions_list():
+    denied = _require_admin_json()
+    if denied: return denied
+    resp = supabase.table("app_versions").select("*,update_channels(product_code,channel_code,channel_name)").order("created_at", desc=True).execute()
+    return jsonify({"success": True, "versions": resp.data or []})
+
+
+@app.route("/admin/versions", methods=["POST"])
+def admin_versions_add():
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    channel_id = data.get("channel_id")
+    version = (data.get("version") or "").strip()
+    download_url = (data.get("download_url") or "").strip()
+    notes = (data.get("notes") or "").strip()
+    if not channel_id or not version or not download_url:
+        return jsonify({"success": False, "message": "Channel, version and GitHub release download URL are required."}), 400
+    payload = {"channel_id": int(channel_id), "version": version, "download_url": download_url, "notes": notes, "mandatory": bool(data.get("mandatory")), "published": True}
+    supabase.table("app_versions").insert(payload).execute()
+    _write_log("app_version_published", payload, request)
+    return jsonify({"success": True, "message": "Version metadata published successfully.", "version": payload})
+
+
+@app.route("/admin/licenses/<path:key>/status", methods=["POST"])
+def admin_license_status(key: str):
+    denied = _require_admin_json()
+    if denied: return denied
+    status = ((request.json or {}).get("status") or "").lower()
+    if status not in ("active", "suspended"):
+        return jsonify({"success": False, "message": "Status must be active or suspended."}), 400
+    supabase.table("licenses").update({"status": status}).eq("key", key.strip().upper()).execute()
+    _write_log("license_status_changed", {"key": key, "status": status}, request)
+    return jsonify({"success": True, "message": f"License marked as {status}."})
+
+
+@app.route("/customer/dashboard", methods=["GET"])
+def customer_dashboard():
+    auth = _current_user(request)
+    if not auth or auth.get("role") not in ("customer", "admin"):
+        return jsonify({"success": False, "message": "Customer login required."}), 401
+    email = _normalize_email(auth.get("email"))
+    if auth.get("role") == "admin" and request.args.get("email"):
+        email = _normalize_email(request.args.get("email"))
+    licenses_resp = supabase.table("licenses").select("*").eq("client_email", email).order("activated_on", desc=True).execute()
+    licenses = [enrich_license(row) for row in (licenses_resp.data or [])]
+    channels = supabase.table("update_channels").select("*").eq("status", "active").execute().data or []
+    versions = supabase.table("app_versions").select("*").eq("published", True).order("created_at", desc=True).execute().data or []
+    latest_by_channel = {}
+    for version in versions:
+        latest_by_channel.setdefault(version.get("channel_id"), version)
+    products = []
+    for lic in licenses:
+        product_channels = []
+        for channel in channels:
+            if slug_code(channel.get("product_code") or "") == lic.get("product_code"):
+                item = dict(channel)
+                item["latest_version"] = latest_by_channel.get(channel.get("id"))
+                product_channels.append(item)
+        products.append({"license": lic, "channels": product_channels})
+    return jsonify({"success": True, "email": email, "products": products})
+
+
+@app.route("/updates/check", methods=["GET"])
+def updates_check():
+    product_code = normalize_product(request.args.get("product"))
+    channel_code = slug_code(request.args.get("channel") or "WINDOWS_EXE")
+    current_version = (request.args.get("current_version") or "").strip()
+    channel_resp = supabase.table("update_channels").select("*").eq("product_code", product_code).eq("channel_code", channel_code).limit(1).execute()
+    channel = (channel_resp.data or [None])[0]
+    if not channel:
+        return jsonify({"success": False, "message": "Update channel not configured."}), 404
+    versions = supabase.table("app_versions").select("*").eq("channel_id", channel.get("id")).eq("published", True).order("created_at", desc=True).limit(1).execute().data or []
+    latest = versions[0] if versions else None
+    return jsonify({"success": True, "product": product_code, "channel": channel_code, "current_version": current_version, "latest": latest, "update_available": bool(latest and latest.get("version") != current_version)})
+
+
+@app.route("/admin/activity-logs", methods=["GET"])
+def admin_activity_logs():
+    denied = _require_admin_json()
+    if denied: return denied
+    resp = supabase.table("activity_logs").select("*").order("created_at", desc=True).limit(100).execute()
+    return jsonify({"success": True, "logs": resp.data or []})
 
 
 if __name__ == "__main__":
