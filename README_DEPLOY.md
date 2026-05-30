@@ -112,3 +112,13 @@ EDU PRIME Desktop App — EXE
 EDU PRIME Teacher App — APK
 EDU PRIME Parent App — APK
 ```
+
+
+## Phase 1.1 patch — Trial keys, license delete and visible dropdowns
+
+This patch adds:
+- clear dark text on light browser drop-down options for customer and software selection;
+- Delete button for demo/test/unwanted license records;
+- standard license or trial key creation with presets for 7, 10, 15 and 30 days, plus custom validity days.
+
+No new Supabase SQL is required for this patch. Existing license records remain compatible.

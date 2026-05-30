@@ -616,6 +616,15 @@ def admin_generate():
     client_phone = (data.get("client_phone") or "").strip()
     client_email = (data.get("client_email") or "").strip()
     notes = (data.get("notes") or "").strip()
+    license_mode = (data.get("license_mode") or "standard").strip().lower()
+    try:
+        validity_days = int(data.get("validity_days") or (365 if license_mode == "standard" else 7))
+    except Exception:
+        validity_days = 365 if license_mode == "standard" else 7
+    if license_mode not in ("standard", "trial"):
+        return jsonify({"success": False, "message": "License type must be standard or trial."}), 400
+    if validity_days < 1 or validity_days > 3650:
+        return jsonify({"success": False, "message": "Validity days must be between 1 and 3650."}), 400
     product = find_product(data.get("product"), include_inactive=True)
     product_code = product["product_code"] if product else normalize_product(data.get("product"))
     product_map = get_product_map(include_inactive=True)
@@ -626,7 +635,12 @@ def admin_generate():
     max_pcs = int(data.get("max_pcs") or product.get("default_limit") or 3)
     key = generate_key(product_code)
     activated_on = today_str()
-    expires_on = (date.today() + timedelta(days=365)).isoformat()
+    expires_on = (date.today() + timedelta(days=validity_days)).isoformat()
+    saved_status = "trial" if license_mode == "trial" else "active"
+    notes_with_type = notes
+    if license_mode == "trial":
+        trial_note = f"TRIAL LICENSE — {validity_days} day(s)"
+        notes_with_type = f"{trial_note} | {notes}" if notes else trial_note
     supabase.table("licenses").insert({
         "key": key,
         "product": product_code,
@@ -638,8 +652,8 @@ def admin_generate():
         "activated_on": activated_on,
         "expires_on": expires_on,
         "last_verified": None,
-        "status": "active",
-        "notes": notes,
+        "status": saved_status,
+        "notes": notes_with_type,
     }).execute()
     return jsonify({
         "success": True,
@@ -647,7 +661,9 @@ def admin_generate():
         "product": product_code,
         "product_name": product["product_name"],
         "expires_on": expires_on,
-        "message": f"License generated for {client_name}",
+        "license_mode": license_mode,
+        "validity_days": validity_days,
+        "message": f"{'Trial key' if license_mode == 'trial' else 'License'} generated for {client_name}",
     })
 
 
@@ -957,13 +973,36 @@ def admin_versions_add():
     return jsonify({"success": True, "message": "Version metadata published successfully.", "version": payload})
 
 
+@app.route("/admin/licenses/<path:key>", methods=["DELETE"])
+def admin_license_delete(key: str):
+    denied = _require_admin_json()
+    if denied: return denied
+    clean_key = (key or "").strip().upper()
+    if not clean_key:
+        return jsonify({"success": False, "message": "License key required."}), 400
+    lic = get_license_by_key(clean_key)
+    if not lic:
+        return jsonify({"success": False, "message": "License key not found."}), 404
+    try:
+        supabase.table("licenses").delete().eq("key", clean_key).execute()
+        _write_log("license_deleted", {
+            "key": clean_key,
+            "product": lic.get("product_code"),
+            "client_name": lic.get("client_name"),
+            "client_email": lic.get("client_email"),
+        }, request)
+    except Exception as e:
+        return jsonify({"success": False, "message": "Could not delete license.", "error": str(e)}), 500
+    return jsonify({"success": True, "message": "License deleted successfully."})
+
+
 @app.route("/admin/licenses/<path:key>/status", methods=["POST"])
 def admin_license_status(key: str):
     denied = _require_admin_json()
     if denied: return denied
     status = ((request.json or {}).get("status") or "").lower()
-    if status not in ("active", "suspended"):
-        return jsonify({"success": False, "message": "Status must be active or suspended."}), 400
+    if status not in ("active", "trial", "suspended"):
+        return jsonify({"success": False, "message": "Status must be active, trial or suspended."}), 400
     supabase.table("licenses").update({"status": status}).eq("key", key.strip().upper()).execute()
     _write_log("license_status_changed", {"key": key, "status": status}, request)
     return jsonify({"success": True, "message": f"License marked as {status}."})
