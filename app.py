@@ -43,6 +43,8 @@ R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "").strip() or (f"https://{R
 R2_SIGNED_URL_SECONDS = int(os.environ.get("R2_SIGNED_URL_SECONDS", "3600"))
 R2_UPLOAD_URL_SECONDS = int(os.environ.get("R2_UPLOAD_URL_SECONDS", "3600"))
 MAX_APP_UPLOAD_MB = int(os.environ.get("MAX_APP_UPLOAD_MB", "500"))
+APP_VERSION_RETENTION_COUNT = max(1, int(os.environ.get("APP_VERSION_RETENTION_COUNT", "2")))
+AUTO_DELETE_OLDER_VERSIONS = os.environ.get("AUTO_DELETE_OLDER_VERSIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
 ALLOWED_APP_EXTENSIONS = {".exe", ".apk", ".msi", ".zip"}
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -251,6 +253,61 @@ def _r2_presigned_put(storage_key: str, content_type: str, expires: int | None =
         Params={"Bucket": R2_BUCKET_NAME, "Key": storage_key, "ContentType": content_type},
         ExpiresIn=max(60, min(int(expires or R2_UPLOAD_URL_SECONDS), 604800)),
     )
+
+
+def _delete_cloud_version(version: dict[str, Any]) -> tuple[bool, str]:
+    """Delete one centrally stored installer and its version metadata safely."""
+    version_id = int(version.get("id") or 0)
+    storage_key = (version.get("storage_key") or "").strip()
+    try:
+        if storage_key:
+            if not _r2_is_configured():
+                return False, "Cloud storage is not configured."
+            _r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=storage_key)
+        if version_id:
+            supabase.table("app_versions").delete().eq("id", version_id).execute()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _cleanup_old_cloud_versions(channel_id: int, keep_count: int | None = None) -> dict[str, Any]:
+    """Keep only the newest central-cloud files for one software channel."""
+    keep = max(1, int(keep_count or APP_VERSION_RETENTION_COUNT))
+    rows = (
+        supabase.table("app_versions")
+        .select("*")
+        .eq("channel_id", int(channel_id))
+        .eq("published", True)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+    cloud_rows = [row for row in rows if (row.get("storage_key") or "").strip()]
+    removed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for row in cloud_rows[keep:]:
+        ok, error = _delete_cloud_version(row)
+        item = {"id": row.get("id"), "version": row.get("version"), "storage_key": row.get("storage_key")}
+        if ok:
+            removed.append(item)
+        else:
+            item["error"] = error
+            failed.append(item)
+    return {"channel_id": int(channel_id), "keep_count": keep, "removed": removed, "failed": failed}
+
+
+def _cleanup_all_cloud_versions(keep_count: int | None = None) -> dict[str, Any]:
+    keep = max(1, int(keep_count or APP_VERSION_RETENTION_COUNT))
+    channels = supabase.table("update_channels").select("id").execute().data or []
+    results = [_cleanup_old_cloud_versions(int(row.get("id") or 0), keep) for row in channels if row.get("id")]
+    return {
+        "keep_count": keep,
+        "removed_count": sum(len(item["removed"]) for item in results),
+        "failed_count": sum(len(item["failed"]) for item in results),
+        "results": results,
+    }
 
 
 def _portal_user_from_request(req) -> dict[str, Any] | None:
@@ -1073,12 +1130,17 @@ def admin_versions_list():
     resp = supabase.table("app_versions").select("*,update_channels(product_code,channel_code,channel_name)").order("created_at", desc=True).execute()
     product_map = get_product_map(include_inactive=True)
     versions = []
+    latest_channels: set[int] = set()
     for row in (resp.data or []):
         item = dict(row)
         channel = dict(item.get("update_channels") or {})
         product = product_map.get(normalize_product(channel.get("product_code")))
         channel["product_name"] = (product or {}).get("product_name") or channel.get("product_code") or "Software"
         item["update_channels"] = channel
+        channel_id = int(item.get("channel_id") or 0)
+        item["is_latest"] = bool(channel_id and channel_id not in latest_channels)
+        if channel_id:
+            latest_channels.add(channel_id)
         versions.append(item)
     return jsonify({"success": True, "versions": versions})
 
@@ -1146,6 +1208,8 @@ def admin_storage_status():
         "provider": "Cloudflare R2",
         "bucket": R2_BUCKET_NAME if configured else "",
         "max_upload_mb": MAX_APP_UPLOAD_MB,
+        "auto_cleanup": AUTO_DELETE_OLDER_VERSIONS,
+        "retention_count": APP_VERSION_RETENTION_COUNT,
         "message": "Central cloud upload is ready." if configured else "Cloudflare R2 is not configured yet. Add the Render Environment Variables first.",
     })
 
@@ -1236,8 +1300,60 @@ def admin_storage_publish_upload():
         created = supabase.table("app_versions").insert(payload).execute().data or []
     except Exception as exc:
         return jsonify({"success": False, "message": "Could not publish this upload. Run the latest Phase 2 SQL file first, or use a different version number.", "error": str(exc)}), 500
-    _write_log("central_app_version_uploaded", payload, request)
-    return jsonify({"success": True, "message": "App uploaded and published successfully.", "version": (created or [payload])[0]})
+    cleanup = {"removed": [], "failed": [], "keep_count": APP_VERSION_RETENTION_COUNT}
+    if AUTO_DELETE_OLDER_VERSIONS:
+        cleanup = _cleanup_old_cloud_versions(channel_id, APP_VERSION_RETENTION_COUNT)
+    _write_log("central_app_version_uploaded", {**payload, "cleanup": cleanup}, request)
+    removed_count = len(cleanup.get("removed") or [])
+    message = "App uploaded and published successfully."
+    if removed_count:
+        message += f" {removed_count} older cloud version(s) were removed automatically."
+    return jsonify({"success": True, "message": message, "version": (created or [payload])[0], "cleanup": cleanup})
+
+
+@app.route("/admin/storage/cleanup", methods=["POST"])
+def admin_storage_cleanup():
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    try:
+        channel_id = int(data.get("channel_id") or 0)
+        keep_count = max(1, int(data.get("keep_count") or APP_VERSION_RETENTION_COUNT))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "Invalid cleanup settings."}), 400
+    result = _cleanup_old_cloud_versions(channel_id, keep_count) if channel_id else _cleanup_all_cloud_versions(keep_count)
+    _write_log("cloud_storage_cleanup", result, request)
+    removed_count = len(result.get("removed") or []) if channel_id else int(result.get("removed_count") or 0)
+    failed_count = len(result.get("failed") or []) if channel_id else int(result.get("failed_count") or 0)
+    return jsonify({
+        "success": True,
+        "message": f"Storage cleanup complete. Removed {removed_count} older cloud version(s)." + (f" {failed_count} file(s) could not be removed; retry later." if failed_count else ""),
+        "cleanup": result,
+    })
+
+
+@app.route("/admin/versions/<int:version_id>/rollback", methods=["POST"])
+def admin_version_rollback(version_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    rows = supabase.table("app_versions").select("*").eq("id", version_id).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Published version not found."}), 404
+    version = rows[0]
+    storage_key = (version.get("storage_key") or "").strip()
+    if storage_key:
+        if not _r2_is_configured():
+            return jsonify({"success": False, "message": "Cloud storage is not configured."}), 503
+        try:
+            _r2_client().head_object(Bucket=R2_BUCKET_NAME, Key=storage_key)
+        except Exception as exc:
+            return jsonify({"success": False, "message": "This older installer file is no longer available in cloud storage.", "error": str(exc)}), 404
+    elif not (version.get("download_url") or "").strip().lower().startswith(("https://", "http://")):
+        return jsonify({"success": False, "message": "This version does not have a valid download file."}), 400
+    now_value = datetime.utcnow().isoformat() + "Z"
+    supabase.table("app_versions").update({"published": True, "created_at": now_value}).eq("id", version_id).execute()
+    _write_log("app_version_rolled_back", {"version_id": version_id, "version": version.get("version"), "channel_id": version.get("channel_id")}, request)
+    return jsonify({"success": True, "message": f"Rollback complete. Version {version.get('version')} is now the latest published version."})
 
 
 @app.route("/admin/versions/<int:version_id>", methods=["DELETE"])
@@ -1249,13 +1365,9 @@ def admin_version_delete(version_id: int):
         return jsonify({"success": False, "message": "Published version not found."}), 404
     version = rows[0]
     storage_key = (version.get("storage_key") or "").strip()
-    if storage_key and _r2_is_configured():
-        try:
-            _r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=storage_key)
-        except Exception:
-            # The metadata can still be removed if the object was already deleted manually.
-            pass
-    supabase.table("app_versions").delete().eq("id", version_id).execute()
+    ok, error = _delete_cloud_version(version)
+    if not ok:
+        return jsonify({"success": False, "message": "Could not delete the published version from cloud storage.", "error": error}), 500
     _write_log("app_version_deleted", {"version_id": version_id, "storage_key": storage_key}, request)
     return jsonify({"success": True, "message": "Published version deleted successfully."})
 
