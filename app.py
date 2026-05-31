@@ -342,8 +342,33 @@ def _active_license_for_email_product(email: str, product_code: str) -> dict[str
 
 
 def slug_code(value: str) -> str:
+    """Normalize compact product/license codes. Product codes remain short for compatibility."""
     cleaned = "".join(ch for ch in value.upper().strip() if ch.isalnum())
     return cleaned[:8]
+
+
+def channel_slug(value: str | None) -> str:
+    """Normalize update-channel codes without truncating values such as WINDOWS_EXE.
+
+    Older builds sent values like WINDOWS_EXE while seeded database rows use
+    WINDOWSEXE. Previous generic slug_code() truncated the value to WINDOWSE,
+    causing secure updater lookups to miss the published channel and silently
+    fall back to an older local manifest. Keep aliases for backward compatibility.
+    """
+    cleaned = "".join(ch for ch in str(value or "").upper().strip() if ch.isalnum())
+    aliases = {
+        "WINDOWS": "WINDOWSEXE",
+        "WINDOWSE": "WINDOWSEXE",
+        "WINDOWSEXE": "WINDOWSEXE",
+        "WINDOWSDESKTOPEXE": "WINDOWSEXE",
+        "ANDROID": "ANDROIDAPK",
+        "ANDROIDAP": "ANDROIDAPK",
+        "ANDROIDAPK": "ANDROIDAPK",
+        "ANDROIDMOBILEAPK": "ANDROIDAPK",
+        "WEB": "WEBAPP",
+        "WEBAPP": "WEBAPP",
+    }
+    return aliases.get(cleaned, cleaned[:32])
 
 
 
@@ -1083,7 +1108,7 @@ def admin_software_add():
     try:
         supabase.table("products").insert(payload).execute()
         for channel_code in channel_codes:
-            ccode = slug_code(channel_code) or "WINDOWS"
+            ccode = channel_slug(channel_code) or "WINDOWSEXE"
             label = {"WINDOWSEXE":"Windows Desktop — EXE", "ANDROIDAPK":"Android Mobile — APK", "WEBAPP":"Web App"}.get(ccode, channel_code.replace("_", " ").title())
             supabase.table("update_channels").insert({"product_code": product_code, "channel_code": ccode, "channel_name": label, "platform": ccode, "status": "active"}).execute()
         _write_log("software_created", {"product_code": product_code, "product_name": product_name, "channels": channel_codes}, request)
@@ -1113,7 +1138,7 @@ def admin_update_channels_add():
     if denied: return denied
     data = request.json or {}
     product_code = normalize_product(data.get("product_code"))
-    channel_code = slug_code(data.get("channel_code") or "WINDOWS_EXE")
+    channel_code = channel_slug(data.get("channel_code") or "WINDOWS_EXE")
     channel_name = (data.get("channel_name") or channel_code).strip()
     if not find_product(product_code, include_inactive=True):
         return jsonify({"success": False, "message": "Create the software product first."}), 400
@@ -1426,8 +1451,14 @@ def customer_download(version_id: int):
 
 
 def _latest_channel_version(product_code: str, channel_code: str):
+    product_code = normalize_product(product_code)
+    channel_code = channel_slug(channel_code)
     channel_rows = supabase.table("update_channels").select("*").eq("product_code", product_code).eq("channel_code", channel_code).limit(1).execute().data or []
     channel = (channel_rows or [None])[0]
+    if not channel:
+        # Backward compatibility for any earlier rows saved with truncated codes.
+        possible = supabase.table("update_channels").select("*").eq("product_code", product_code).execute().data or []
+        channel = next((row for row in possible if channel_slug(row.get("channel_code")) == channel_code), None)
     if not channel:
         return None, None
     versions = supabase.table("app_versions").select("*").eq("channel_id", channel.get("id")).eq("published", True).order("created_at", desc=True).limit(1).execute().data or []
@@ -1442,7 +1473,7 @@ def updates_check():
     a valid license key can receive a temporary secure download URL.
     """
     product_code = normalize_product(request.args.get("product"))
-    channel_code = slug_code(request.args.get("channel") or "WINDOWS_EXE")
+    channel_code = channel_slug(request.args.get("channel") or "WINDOWS_EXE")
     current_version = (request.args.get("current_version") or "").strip()
     channel, latest = _latest_channel_version(product_code, channel_code)
     if not channel:
@@ -1457,7 +1488,7 @@ def secure_updates_check():
     data = request.get_json(silent=True) or request.args
     key = (data.get("license_key") or data.get("key") or "").strip().upper()
     product_code = normalize_product(data.get("product"))
-    channel_code = slug_code(data.get("channel") or "WINDOWS_EXE")
+    channel_code = channel_slug(data.get("channel") or "WINDOWS_EXE")
     current_version = (data.get("current_version") or "").strip()
     machine_id = (data.get("machine_id") or "").strip()
     lic = get_license_by_key(key)

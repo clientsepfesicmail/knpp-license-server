@@ -19,3 +19,6 @@ The defaults already match the approved setup. Add these only if you later want 
 APP_VERSION_RETENTION_COUNT=2
 AUTO_DELETE_OLDER_VERSIONS=true
 ```
+
+## Phase 2.2 updater channel normalization fix
+Upload the latest `app.py` to the repository root and let Render auto-deploy. No SQL migration or environment-variable change is required.
