@@ -1,0 +1,14 @@
+Add these in Render Dashboard -> knpp-license-server -> Environment:
+
+R2_ACCOUNT_ID=your Cloudflare account id
+R2_ACCESS_KEY_ID=your R2 access key id
+R2_SECRET_ACCESS_KEY=your R2 secret access key
+R2_BUCKET_NAME=tezhisab-app-updates
+R2_SIGNED_URL_SECONDS=3600
+R2_UPLOAD_URL_SECONDS=3600
+MAX_APP_UPLOAD_MB=500
+
+Optional only if needed:
+R2_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+
+Never paste secrets into Flutter, HTML, GitHub source code or chat.

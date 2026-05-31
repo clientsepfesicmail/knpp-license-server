@@ -1,0 +1,13 @@
+[
+  {
+    "AllowedOrigins": [
+      "https://knpp-license-server.onrender.com",
+      "https://tezhisab.com",
+      "https://www.tezhisab.com"
+    ],
+    "AllowedMethods": ["GET", "PUT", "HEAD"],
+    "AllowedHeaders": ["Content-Type"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]

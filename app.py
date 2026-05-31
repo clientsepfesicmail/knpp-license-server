@@ -3,14 +3,24 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import string
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, redirect, request, send_from_directory
 from supabase import Client, create_client
+from werkzeug.utils import secure_filename
+
+try:
+    import boto3
+    from botocore.client import Config as BotoConfig
+except Exception:  # Storage remains disabled until boto3 is installed/configured.
+    boto3 = None
+    BotoConfig = None
 
 app = Flask(__name__, static_folder="admin", static_url_path="")
 
@@ -23,6 +33,17 @@ SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "24"))
 BRAND_NAME = "Tezhisab"
 LICENSE_PREFIX = "PPPM"
 DEFAULT_PRODUCT_CODE = "EEM"
+
+# Cloudflare R2 central file storage. Keep all credentials in Render Environment Variables.
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "").strip()
+R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "").strip() or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "")
+R2_SIGNED_URL_SECONDS = int(os.environ.get("R2_SIGNED_URL_SECONDS", "3600"))
+R2_UPLOAD_URL_SECONDS = int(os.environ.get("R2_UPLOAD_URL_SECONDS", "3600"))
+MAX_APP_UPLOAD_MB = int(os.environ.get("MAX_APP_UPLOAD_MB", "500"))
+ALLOWED_APP_EXTENSIONS = {".exe", ".apk", ".msi", ".zip"}
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -171,6 +192,96 @@ def _write_log(action: str, details: dict[str, Any] | None = None, req=None) -> 
         # Logging must never interrupt licensing.
         pass
 
+
+
+
+def _r2_is_configured() -> bool:
+    return bool(boto3 and BotoConfig and R2_ENDPOINT_URL and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME)
+
+
+def _r2_client():
+    if not _r2_is_configured():
+        raise RuntimeError("Cloud storage is not configured. Add the R2 Environment Variables in Render first.")
+    return boto3.client(
+        service_name="s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
+def _safe_app_filename(filename: str) -> str:
+    clean = secure_filename(filename or "")
+    if not clean:
+        raise ValueError("Select a valid EXE, APK, MSI or ZIP file.")
+    suffix = Path(clean).suffix.lower()
+    if suffix not in ALLOWED_APP_EXTENSIONS:
+        raise ValueError("Only EXE, APK, MSI and ZIP files are allowed.")
+    return clean
+
+
+def _clean_path_piece(value: Any, fallback: str = "item") -> str:
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("-._")
+    return clean[:80] or fallback
+
+
+def _new_storage_key(channel: dict[str, Any], version: str, filename: str) -> str:
+    product = _clean_path_piece(channel.get("product_code"), "software").lower()
+    channel_code = _clean_path_piece(channel.get("channel_code"), "channel").lower()
+    version_piece = _clean_path_piece(version, "version")
+    safe_name = _safe_app_filename(filename)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    random_piece = secrets.token_hex(4)
+    return f"apps/{product}/{channel_code}/{version_piece}/{stamp}_{random_piece}_{safe_name}"
+
+
+def _r2_presigned_get(storage_key: str, expires: int | None = None) -> str:
+    return _r2_client().generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": storage_key},
+        ExpiresIn=max(60, min(int(expires or R2_SIGNED_URL_SECONDS), 604800)),
+    )
+
+
+def _r2_presigned_put(storage_key: str, content_type: str, expires: int | None = None) -> str:
+    return _r2_client().generate_presigned_url(
+        ClientMethod="put_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": storage_key, "ContentType": content_type},
+        ExpiresIn=max(60, min(int(expires or R2_UPLOAD_URL_SECONDS), 604800)),
+    )
+
+
+def _portal_user_from_request(req) -> dict[str, Any] | None:
+    return _current_user(req) or _read_token(req.args.get("token"))
+
+
+def _version_response(version: dict[str, Any] | None, include_presigned_download: bool = False) -> dict[str, Any] | None:
+    if not version:
+        return None
+    item = dict(version)
+    storage_key = (item.get("storage_key") or "").strip()
+    if storage_key:
+        item["delivery_mode"] = "central_cloud"
+        item["download_url"] = _r2_presigned_get(storage_key) if include_presigned_download and _r2_is_configured() else ""
+        item["download_requires_login"] = not include_presigned_download
+    else:
+        item["delivery_mode"] = "external_link"
+        item["download_requires_login"] = False
+    return item
+
+
+def _active_license_for_email_product(email: str, product_code: str) -> dict[str, Any] | None:
+    rows = supabase.table("licenses").select("*").eq("client_email", _normalize_email(email)).execute().data or []
+    for row in rows:
+        lic = enrich_license(row)
+        if lic.get("product_code") != normalize_product(product_code):
+            continue
+        if lic.get("status") == "suspended" or lic.get("days_left", -1) < 0:
+            continue
+        return lic
+    return None
 
 
 def slug_code(value: str) -> str:
@@ -929,7 +1040,14 @@ def admin_update_channels_list():
     denied = _require_admin_json()
     if denied: return denied
     resp = supabase.table("update_channels").select("*").order("product_code").execute()
-    return jsonify({"success": True, "channels": resp.data or []})
+    product_map = get_product_map(include_inactive=True)
+    channels = []
+    for row in (resp.data or []):
+        item = dict(row)
+        product = product_map.get(normalize_product(item.get("product_code")))
+        item["product_name"] = (product or {}).get("product_name") or item.get("product_code") or "Software"
+        channels.append(item)
+    return jsonify({"success": True, "channels": channels})
 
 
 @app.route("/admin/update-channels", methods=["POST"])
@@ -953,7 +1071,16 @@ def admin_versions_list():
     denied = _require_admin_json()
     if denied: return denied
     resp = supabase.table("app_versions").select("*,update_channels(product_code,channel_code,channel_name)").order("created_at", desc=True).execute()
-    return jsonify({"success": True, "versions": resp.data or []})
+    product_map = get_product_map(include_inactive=True)
+    versions = []
+    for row in (resp.data or []):
+        item = dict(row)
+        channel = dict(item.get("update_channels") or {})
+        product = product_map.get(normalize_product(channel.get("product_code")))
+        channel["product_name"] = (product or {}).get("product_name") or channel.get("product_code") or "Software"
+        item["update_channels"] = channel
+        versions.append(item)
+    return jsonify({"success": True, "versions": versions})
 
 
 @app.route("/admin/versions", methods=["POST"])
@@ -966,11 +1093,11 @@ def admin_versions_add():
     download_url = (data.get("download_url") or "").strip()
     notes = (data.get("notes") or "").strip()
     if not channel_id or not version or not download_url:
-        return jsonify({"success": False, "message": "Channel, version and GitHub release download URL are required."}), 400
+        return jsonify({"success": False, "message": "Channel, version and download URL are required."}), 400
     payload = {"channel_id": int(channel_id), "version": version, "download_url": download_url, "notes": notes, "mandatory": bool(data.get("mandatory")), "published": True}
     supabase.table("app_versions").insert(payload).execute()
     _write_log("app_version_published", payload, request)
-    return jsonify({"success": True, "message": "Version metadata published successfully.", "version": payload})
+    return jsonify({"success": True, "message": "External-link version published successfully.", "version": payload})
 
 
 @app.route("/admin/licenses/<path:key>", methods=["DELETE"])
@@ -1008,6 +1135,131 @@ def admin_license_status(key: str):
     return jsonify({"success": True, "message": f"License marked as {status}."})
 
 
+@app.route("/admin/storage/status", methods=["GET"])
+def admin_storage_status():
+    denied = _require_admin_json()
+    if denied: return denied
+    configured = _r2_is_configured()
+    return jsonify({
+        "success": True,
+        "configured": configured,
+        "provider": "Cloudflare R2",
+        "bucket": R2_BUCKET_NAME if configured else "",
+        "max_upload_mb": MAX_APP_UPLOAD_MB,
+        "message": "Central cloud upload is ready." if configured else "Cloudflare R2 is not configured yet. Add the Render Environment Variables first.",
+    })
+
+
+@app.route("/admin/storage/presign-upload", methods=["POST"])
+def admin_storage_presign_upload():
+    denied = _require_admin_json()
+    if denied: return denied
+    if not _r2_is_configured():
+        return jsonify({"success": False, "message": "Cloudflare R2 is not configured. Add the required Render Environment Variables first."}), 503
+    data = request.json or {}
+    try:
+        channel_id = int(data.get("channel_id") or 0)
+        version = (data.get("version") or "").strip()
+        filename = _safe_app_filename(data.get("filename") or "")
+        content_type = (data.get("content_type") or "application/octet-stream").strip()
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    if not channel_id or not version:
+        return jsonify({"success": False, "message": "Update channel and version are required."}), 400
+    if size_bytes <= 0:
+        return jsonify({"success": False, "message": "Selected file is empty."}), 400
+    if size_bytes > MAX_APP_UPLOAD_MB * 1024 * 1024:
+        return jsonify({"success": False, "message": f"File is larger than the configured {MAX_APP_UPLOAD_MB} MB upload limit."}), 400
+    channel_rows = supabase.table("update_channels").select("*").eq("id", channel_id).limit(1).execute().data or []
+    if not channel_rows:
+        return jsonify({"success": False, "message": "Update channel not found."}), 404
+    channel = channel_rows[0]
+    storage_key = _new_storage_key(channel, version, filename)
+    try:
+        upload_url = _r2_presigned_put(storage_key, content_type)
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not prepare the secure cloud upload URL.", "error": str(exc)}), 500
+    _write_log("central_upload_url_created", {"channel_id": channel_id, "version": version, "storage_key": storage_key, "size_bytes": size_bytes}, request)
+    return jsonify({
+        "success": True,
+        "upload_url": upload_url,
+        "storage_key": storage_key,
+        "headers": {"Content-Type": content_type},
+        "expires_in": R2_UPLOAD_URL_SECONDS,
+        "message": "Secure upload URL created.",
+    })
+
+
+@app.route("/admin/storage/publish-upload", methods=["POST"])
+def admin_storage_publish_upload():
+    denied = _require_admin_json()
+    if denied: return denied
+    if not _r2_is_configured():
+        return jsonify({"success": False, "message": "Cloudflare R2 is not configured."}), 503
+    data = request.json or {}
+    try:
+        channel_id = int(data.get("channel_id") or 0)
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "Invalid channel or file size."}), 400
+    version = (data.get("version") or "").strip()
+    storage_key = (data.get("storage_key") or "").strip()
+    original_filename = _safe_app_filename(data.get("original_filename") or "")
+    content_type = (data.get("content_type") or "application/octet-stream").strip()
+    notes = (data.get("notes") or "").strip()
+    if not channel_id or not version or not storage_key.startswith("apps/"):
+        return jsonify({"success": False, "message": "Channel, version and uploaded cloud file are required."}), 400
+    try:
+        head = _r2_client().head_object(Bucket=R2_BUCKET_NAME, Key=storage_key)
+        stored_size = int(head.get("ContentLength") or 0)
+        if size_bytes and stored_size != size_bytes:
+            return jsonify({"success": False, "message": "Uploaded file size verification failed. Please upload again."}), 400
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Uploaded file could not be verified in cloud storage.", "error": str(exc)}), 400
+    auth = _current_user(request) or {}
+    payload = {
+        "channel_id": channel_id,
+        "version": version,
+        "download_url": f"r2://{R2_BUCKET_NAME}/{storage_key}",
+        "notes": notes,
+        "mandatory": bool(data.get("mandatory")),
+        "published": True,
+        "storage_provider": "cloudflare_r2",
+        "storage_key": storage_key,
+        "original_filename": original_filename,
+        "content_type": content_type,
+        "size_bytes": stored_size,
+        "uploaded_by": auth.get("email") or "admin",
+    }
+    try:
+        created = supabase.table("app_versions").insert(payload).execute().data or []
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not publish this upload. Run the latest Phase 2 SQL file first, or use a different version number.", "error": str(exc)}), 500
+    _write_log("central_app_version_uploaded", payload, request)
+    return jsonify({"success": True, "message": "App uploaded and published successfully.", "version": (created or [payload])[0]})
+
+
+@app.route("/admin/versions/<int:version_id>", methods=["DELETE"])
+def admin_version_delete(version_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    rows = supabase.table("app_versions").select("*").eq("id", version_id).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Published version not found."}), 404
+    version = rows[0]
+    storage_key = (version.get("storage_key") or "").strip()
+    if storage_key and _r2_is_configured():
+        try:
+            _r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=storage_key)
+        except Exception:
+            # The metadata can still be removed if the object was already deleted manually.
+            pass
+    supabase.table("app_versions").delete().eq("id", version_id).execute()
+    _write_log("app_version_deleted", {"version_id": version_id, "storage_key": storage_key}, request)
+    return jsonify({"success": True, "message": "Published version deleted successfully."})
+
+
 @app.route("/customer/dashboard", methods=["GET"])
 def customer_dashboard():
     auth = _current_user(request)
@@ -1022,7 +1274,7 @@ def customer_dashboard():
     versions = supabase.table("app_versions").select("*").eq("published", True).order("created_at", desc=True).execute().data or []
     latest_by_channel = {}
     for version in versions:
-        latest_by_channel.setdefault(version.get("channel_id"), version)
+        latest_by_channel.setdefault(version.get("channel_id"), _version_response(version, include_presigned_download=False))
     products = []
     for lic in licenses:
         product_channels = []
@@ -1035,18 +1287,91 @@ def customer_dashboard():
     return jsonify({"success": True, "email": email, "products": products})
 
 
+@app.route("/customer/download/<int:version_id>", methods=["GET"])
+def customer_download(version_id: int):
+    auth = _portal_user_from_request(request)
+    if not auth or auth.get("role") not in ("customer", "admin"):
+        return jsonify({"success": False, "message": "Customer login required."}), 401
+    rows = supabase.table("app_versions").select("*,update_channels(product_code,channel_code)").eq("id", version_id).eq("published", True).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Published app version not found."}), 404
+    version = rows[0]
+    channel = dict(version.get("update_channels") or {})
+    product_code = normalize_product(channel.get("product_code"))
+    if auth.get("role") != "admin" and not _active_license_for_email_product(auth.get("email") or "", product_code):
+        return jsonify({"success": False, "message": "This software is not assigned to your active customer account."}), 403
+    storage_key = (version.get("storage_key") or "").strip()
+    if storage_key:
+        if not _r2_is_configured():
+            return jsonify({"success": False, "message": "Cloud download is temporarily unavailable. Please contact Tezhisab support."}), 503
+        url = _r2_presigned_get(storage_key)
+    else:
+        url = (version.get("download_url") or "").strip()
+        if not url.lower().startswith(("https://", "http://")):
+            return jsonify({"success": False, "message": "Download link is not configured."}), 404
+    _write_log("customer_app_download", {"version_id": version_id, "product_code": product_code, "email": auth.get("email")}, request)
+    return redirect(url, code=302)
+
+
+def _latest_channel_version(product_code: str, channel_code: str):
+    channel_rows = supabase.table("update_channels").select("*").eq("product_code", product_code).eq("channel_code", channel_code).limit(1).execute().data or []
+    channel = (channel_rows or [None])[0]
+    if not channel:
+        return None, None
+    versions = supabase.table("app_versions").select("*").eq("channel_id", channel.get("id")).eq("published", True).order("created_at", desc=True).limit(1).execute().data or []
+    return channel, (versions or [None])[0]
+
+
 @app.route("/updates/check", methods=["GET"])
 def updates_check():
+    """Legacy metadata endpoint. Existing GitHub-based apps remain compatible.
+
+    For central R2 uploads, installed apps should move to /api/v2/updates/check so
+    a valid license key can receive a temporary secure download URL.
+    """
     product_code = normalize_product(request.args.get("product"))
     channel_code = slug_code(request.args.get("channel") or "WINDOWS_EXE")
     current_version = (request.args.get("current_version") or "").strip()
-    channel_resp = supabase.table("update_channels").select("*").eq("product_code", product_code).eq("channel_code", channel_code).limit(1).execute()
-    channel = (channel_resp.data or [None])[0]
+    channel, latest = _latest_channel_version(product_code, channel_code)
     if not channel:
         return jsonify({"success": False, "message": "Update channel not configured."}), 404
-    versions = supabase.table("app_versions").select("*").eq("channel_id", channel.get("id")).eq("published", True).order("created_at", desc=True).limit(1).execute().data or []
-    latest = versions[0] if versions else None
-    return jsonify({"success": True, "product": product_code, "channel": channel_code, "current_version": current_version, "latest": latest, "update_available": bool(latest and latest.get("version") != current_version)})
+    public_latest = _version_response(latest, include_presigned_download=False)
+    return jsonify({"success": True, "product": product_code, "channel": channel_code, "current_version": current_version, "latest": public_latest, "update_available": bool(latest and latest.get("version") != current_version)})
+
+
+@app.route("/api/v2/updates/check", methods=["GET", "POST"])
+def secure_updates_check():
+    """Secure updater endpoint for future app builds connected to Tezhisab Portal."""
+    data = request.get_json(silent=True) or request.args
+    key = (data.get("license_key") or data.get("key") or "").strip().upper()
+    product_code = normalize_product(data.get("product"))
+    channel_code = slug_code(data.get("channel") or "WINDOWS_EXE")
+    current_version = (data.get("current_version") or "").strip()
+    machine_id = (data.get("machine_id") or "").strip()
+    lic = get_license_by_key(key)
+    if not lic:
+        return jsonify({"success": False, "message": "License key not found."}), 404
+    if lic.get("product_code") != product_code:
+        return jsonify({"success": False, "message": "License key is not valid for this software."}), 403
+    if lic.get("status") == "suspended" or lic.get("days_left", -1) < 0:
+        return jsonify({"success": False, "message": "License is inactive or expired."}), 403
+    machines = lic.get("machines") or []
+    if machine_id and machines and machine_id not in {m.get("id") for m in machines}:
+        return jsonify({"success": False, "message": "This computer is not activated for the license."}), 403
+    channel, latest = _latest_channel_version(product_code, channel_code)
+    if not channel:
+        return jsonify({"success": False, "message": "Update channel not configured."}), 404
+    secure_latest = _version_response(latest, include_presigned_download=True)
+    return jsonify({
+        "success": True,
+        "product": product_code,
+        "channel": channel_code,
+        "current_version": current_version,
+        "latest": secure_latest,
+        "update_available": bool(latest and latest.get("version") != current_version),
+        "license_status": lic.get("status"),
+        "license_expires_on": lic.get("expires_on"),
+    })
 
 
 @app.route("/admin/activity-logs", methods=["GET"])
