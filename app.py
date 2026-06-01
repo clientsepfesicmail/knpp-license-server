@@ -1465,6 +1465,147 @@ def _latest_channel_version(product_code: str, channel_code: str):
     return channel, (versions or [None])[0]
 
 
+
+
+def _edu_prime_school_license_status(school_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Return current central EDU PRIME master-license status for one school.
+
+    Mobile apps never receive or store the paid license key. The Desktop App
+    activates the master key once and links it to the school's cloud ID.
+    """
+    normalized_school_id = (school_id or "").strip()
+    if not normalized_school_id:
+        return None, "School ID is required."
+    try:
+        rows = (
+            supabase.table("edu_prime_school_licenses")
+            .select("*")
+            .eq("school_id", normalized_school_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        return None, f"EDU PRIME master-license table is not ready. Run the latest Phase 2.3 SQL file first. ({exc})"
+    if not rows:
+        return None, "This school's EDU PRIME master license has not been linked from the Desktop App yet."
+    binding = dict(rows[0])
+    key = (binding.get("license_key") or "").strip().upper()
+    lic = get_license_by_key(key)
+    if not lic:
+        return None, "The linked EDU PRIME master license was not found."
+    if lic.get("product_code") != "EDUPRIME":
+        return None, "The linked license is not an EDU PRIME master license."
+    if (lic.get("status") or "active").lower() not in ("active", "trial"):
+        return None, "The school's EDU PRIME master license is suspended. Please contact Tezhisab support."
+    if int(lic.get("days_left") if lic.get("days_left") is not None else -1) < 0:
+        return None, f"The school's EDU PRIME master license expired on {lic.get('expires_on') or ''}. Please renew."
+    payload = {
+        "school_id": normalized_school_id,
+        "school_name": binding.get("school_name") or lic.get("client_name") or "EDU PRIME School",
+        "client_email": binding.get("client_email") or lic.get("client_email") or "",
+        "license_status": lic.get("status") or "active",
+        "expires_on": lic.get("expires_on") or "",
+        "days_left": int(lic.get("days_left") or 0),
+        "last_verified_at": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        supabase.table("edu_prime_school_licenses").update({
+            "school_name": payload["school_name"],
+            "client_email": payload["client_email"],
+            "license_status": payload["license_status"],
+            "expires_on": payload["expires_on"],
+            "last_verified_at": payload["last_verified_at"],
+            "updated_at": payload["last_verified_at"],
+        }).eq("school_id", normalized_school_id).execute()
+    except Exception:
+        pass
+    return payload, None
+
+
+@app.route("/api/v2/edu-prime/school-license/link", methods=["POST"])
+def edu_prime_school_license_link():
+    """Link one activated EDU PRIME desktop master license to one school ID."""
+    data = request.get_json(silent=True) or {}
+    key = (data.get("license_key") or data.get("key") or "").strip().upper()
+    school_id = (data.get("school_id") or "").strip()
+    school_name = (data.get("school_name") or "").strip()
+    machine_id = (data.get("machine_id") or "").strip()
+    if not key or not school_id or not machine_id:
+        return jsonify({"success": False, "message": "License key, School ID and Machine ID are required."}), 400
+    lic = get_license_by_key(key)
+    if not lic:
+        return jsonify({"success": False, "message": "License key not found."}), 404
+    if lic.get("product_code") != "EDUPRIME":
+        return jsonify({"success": False, "message": "This license key is not valid for EDU PRIME."}), 403
+    if (lic.get("status") or "active").lower() not in ("active", "trial") or int(lic.get("days_left") or -1) < 0:
+        return jsonify({"success": False, "message": "This EDU PRIME master license is inactive or expired."}), 403
+    machines = lic.get("machines") or []
+    if machine_id not in {m.get("id") for m in machines}:
+        return jsonify({"success": False, "message": "Activate this Desktop App with the EDU PRIME license before linking the school."}), 403
+    now_value = datetime.utcnow().isoformat() + "Z"
+    payload = {
+        "school_id": school_id,
+        "school_name": school_name or lic.get("client_name") or "EDU PRIME School",
+        "license_key": key,
+        "client_email": lic.get("client_email") or "",
+        "desktop_machine_id": machine_id,
+        "license_status": lic.get("status") or "active",
+        "expires_on": lic.get("expires_on") or "",
+        "last_verified_at": now_value,
+        "updated_at": now_value,
+    }
+    try:
+        supabase.table("edu_prime_school_licenses").upsert(payload, on_conflict="school_id").execute()
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not link school master license. Run the latest Phase 2.3 SQL file first.", "error": str(exc)}), 500
+    _write_log("edu_prime_school_master_license_linked", {"school_id": school_id, "client_email": payload["client_email"], "machine_id": machine_id}, request)
+    return jsonify({"success": True, "message": "EDU PRIME master license linked to this school successfully.", "school_license": {k: v for k, v in payload.items() if k != "license_key"}})
+
+
+@app.route("/api/v2/edu-prime/school-license/check", methods=["GET", "POST"])
+def edu_prime_school_license_check():
+    """Mobile-safe school master-license check. The paid key is never returned."""
+    data = request.get_json(silent=True) or request.args
+    status, error = _edu_prime_school_license_status((data.get("school_id") or "").strip())
+    if not status:
+        return jsonify({"success": False, "active": False, "message": error or "EDU PRIME master license is not active."}), 403
+    return jsonify({"success": True, "active": True, "message": "School master license is active.", "school_license": status})
+
+
+@app.route("/api/v2/edu-prime/mobile-updates/check", methods=["GET", "POST"])
+def edu_prime_mobile_updates_check():
+    """Secure Teacher / Parent / Admin APK update check through the school master license."""
+    data = request.get_json(silent=True) or request.args
+    school_id = (data.get("school_id") or "").strip()
+    app_type = (data.get("app_type") or "").strip().lower()
+    current_version = (data.get("current_version") or "").strip()
+    status, error = _edu_prime_school_license_status(school_id)
+    if not status:
+        return jsonify({"success": False, "active": False, "message": error or "School master license is inactive."}), 403
+    channel_code = {
+        "teacher": "ANDROID_TEACHER_APK",
+        "parent": "ANDROID_PARENT_APK",
+        "admin": "ANDROID_ADMIN_APK",
+    }.get(app_type)
+    if not channel_code:
+        return jsonify({"success": False, "message": "App type must be teacher, parent or admin."}), 400
+    channel, latest = _latest_channel_version("EDUPRIME", channel_code)
+    if not channel:
+        return jsonify({"success": False, "message": "EDU PRIME mobile update channel is not configured."}), 404
+    secure_latest = _version_response(latest, include_presigned_download=True)
+    return jsonify({
+        "success": True,
+        "active": True,
+        "school_id": school_id,
+        "app_type": app_type,
+        "current_version": current_version,
+        "latest": secure_latest,
+        "update_available": bool(latest and latest.get("version") != current_version),
+        "license_expires_on": status.get("expires_on"),
+    })
+
 @app.route("/updates/check", methods=["GET"])
 def updates_check():
     """Legacy metadata endpoint. Existing GitHub-based apps remain compatible.
