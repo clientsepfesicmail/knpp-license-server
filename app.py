@@ -10,6 +10,8 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 from flask import Flask, jsonify, redirect, request, send_from_directory
 from supabase import Client, create_client
@@ -46,6 +48,11 @@ MAX_APP_UPLOAD_MB = int(os.environ.get("MAX_APP_UPLOAD_MB", "500"))
 APP_VERSION_RETENTION_COUNT = max(1, int(os.environ.get("APP_VERSION_RETENTION_COUNT", "2")))
 AUTO_DELETE_OLDER_VERSIONS = os.environ.get("AUTO_DELETE_OLDER_VERSIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
 ALLOWED_APP_EXTENSIONS = {".exe", ".apk", ".msi", ".zip"}
+ALLOWED_REQUIREMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".zip"}
+MAX_REQUIREMENT_UPLOAD_MB = int(os.environ.get("MAX_REQUIREMENT_UPLOAD_MB", "15"))
+TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
+TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -229,14 +236,37 @@ def _clean_path_piece(value: Any, fallback: str = "item") -> str:
     return clean[:80] or fallback
 
 
-def _new_storage_key(channel: dict[str, Any], version: str, filename: str) -> str:
+def _edition_code(value: Any) -> str:
+    clean = re.sub(r"[^A-Za-z0-9]+", "", str(value or "").upper())
+    return clean[:32] or "STANDARD"
+
+
+def _new_storage_key(channel: dict[str, Any], version: str, filename: str, edition_code: str = "STANDARD") -> str:
     product = _clean_path_piece(channel.get("product_code"), "software").lower()
     channel_code = _clean_path_piece(channel.get("channel_code"), "channel").lower()
+    edition_piece = _clean_path_piece(_edition_code(edition_code), "standard").lower()
     version_piece = _clean_path_piece(version, "version")
     safe_name = _safe_app_filename(filename)
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     random_piece = secrets.token_hex(4)
-    return f"apps/{product}/{channel_code}/{version_piece}/{stamp}_{random_piece}_{safe_name}"
+    return f"apps/{product}/{edition_piece}/{channel_code}/{version_piece}/{stamp}_{random_piece}_{safe_name}"
+
+
+def _safe_requirement_filename(filename: str) -> str:
+    clean = secure_filename(filename or "")
+    if not clean:
+        raise ValueError("Select a valid PDF, image, document, spreadsheet or ZIP file.")
+    suffix = Path(clean).suffix.lower()
+    if suffix not in ALLOWED_REQUIREMENT_EXTENSIONS:
+        raise ValueError("Allowed attachments: PDF, image, Word, Excel, CSV, TXT or ZIP.")
+    return clean
+
+
+def _new_requirement_storage_key(email: str, filename: str) -> str:
+    customer_piece = _clean_path_piece(_normalize_email(email).replace("@", "-at-"), "visitor").lower()
+    safe_name = _safe_requirement_filename(filename)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return f"requirements/{customer_piece}/{stamp}_{secrets.token_hex(4)}_{safe_name}"
 
 
 def _r2_presigned_get(storage_key: str, expires: int | None = None) -> str:
@@ -271,31 +301,36 @@ def _delete_cloud_version(version: dict[str, Any]) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _cleanup_old_cloud_versions(channel_id: int, keep_count: int | None = None) -> dict[str, Any]:
-    """Keep only the newest central-cloud files for one software channel."""
+def _cleanup_old_cloud_versions(channel_id: int, keep_count: int | None = None, edition_id: int | None = None) -> dict[str, Any]:
+    """Keep the newest cloud files separately for each software edition."""
     keep = max(1, int(keep_count or APP_VERSION_RETENTION_COUNT))
-    rows = (
+    query = (
         supabase.table("app_versions")
         .select("*")
         .eq("channel_id", int(channel_id))
         .eq("published", True)
         .order("created_at", desc=True)
-        .execute()
-        .data
-        or []
     )
-    cloud_rows = [row for row in rows if (row.get("storage_key") or "").strip()]
+    if edition_id is not None:
+        query = query.eq("edition_id", int(edition_id))
+    rows = query.execute().data or []
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        group_id = int(row.get("edition_id") or 0)
+        grouped.setdefault(group_id, []).append(row)
     removed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    for row in cloud_rows[keep:]:
-        ok, error = _delete_cloud_version(row)
-        item = {"id": row.get("id"), "version": row.get("version"), "storage_key": row.get("storage_key")}
-        if ok:
-            removed.append(item)
-        else:
-            item["error"] = error
-            failed.append(item)
-    return {"channel_id": int(channel_id), "keep_count": keep, "removed": removed, "failed": failed}
+    for group_id, group_rows in grouped.items():
+        cloud_rows = [row for row in group_rows if (row.get("storage_key") or "").strip()]
+        for row in cloud_rows[keep:]:
+            ok, error = _delete_cloud_version(row)
+            item = {"id": row.get("id"), "version": row.get("version"), "edition_id": group_id or None, "storage_key": row.get("storage_key")}
+            if ok:
+                removed.append(item)
+            else:
+                item["error"] = error
+                failed.append(item)
+    return {"channel_id": int(channel_id), "edition_id": edition_id, "keep_count": keep, "removed": removed, "failed": failed}
 
 
 def _cleanup_all_cloud_versions(keep_count: int | None = None) -> dict[str, Any]:
@@ -310,6 +345,54 @@ def _cleanup_all_cloud_versions(keep_count: int | None = None) -> dict[str, Any]
     }
 
 
+def _fetch_edition(edition_id: Any) -> dict[str, Any] | None:
+    try:
+        edition_id = int(edition_id or 0)
+    except Exception:
+        edition_id = 0
+    if not edition_id:
+        return None
+    try:
+        rows = supabase.table("product_editions").select("*").eq("id", edition_id).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _edition_summary(edition: dict[str, Any] | None) -> dict[str, Any]:
+    if not edition:
+        return {"id": None, "edition_code": "STANDARD", "edition_name": "Standard Edition", "release_scope": "standard"}
+    return {
+        "id": edition.get("id"),
+        "edition_code": _edition_code(edition.get("edition_code")),
+        "edition_name": (edition.get("edition_name") or "Custom Edition").strip(),
+        "release_scope": (edition.get("release_scope") or "customer_specific").strip(),
+        "customer_id": edition.get("customer_id"),
+        "status": edition.get("status") or "active",
+    }
+
+
+def _edition_for_license(license_row: dict[str, Any] | None) -> dict[str, Any]:
+    return _edition_summary(_fetch_edition((license_row or {}).get("edition_id")))
+
+
+def _verify_turnstile(token: str | None, remote_ip: str | None = None) -> tuple[bool, str]:
+    """Verify Cloudflare Turnstile only when it is configured in Render."""
+    if not TURNSTILE_SECRET_KEY:
+        return True, "Turnstile is not configured; registration remains available."
+    if not token:
+        return False, "Please complete the security verification."
+    try:
+        form = {"secret": TURNSTILE_SECRET_KEY, "response": token}
+        if remote_ip:
+            form["remoteip"] = remote_ip
+        req = urllib_request.Request(TURNSTILE_VERIFY_URL, data=urllib_parse.urlencode(form).encode(), method="POST")
+        with urllib_request.urlopen(req, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return bool(payload.get("success")), "" if payload.get("success") else "Security verification failed. Please refresh and try again."
+    except Exception:
+        return False, "Security verification could not be completed. Please try again."
+
 def _portal_user_from_request(req) -> dict[str, Any] | None:
     return _current_user(req) or _read_token(req.args.get("token"))
 
@@ -318,6 +401,7 @@ def _version_response(version: dict[str, Any] | None, include_presigned_download
     if not version:
         return None
     item = dict(version)
+    item["edition"] = _edition_summary(_fetch_edition(item.get("edition_id")))
     storage_key = (item.get("storage_key") or "").strip()
     if storage_key:
         item["delivery_mode"] = "central_cloud"
@@ -334,6 +418,20 @@ def _active_license_for_email_product(email: str, product_code: str) -> dict[str
     for row in rows:
         lic = enrich_license(row)
         if lic.get("product_code") != normalize_product(product_code):
+            continue
+        if lic.get("status") == "suspended" or lic.get("days_left", -1) < 0:
+            continue
+        return lic
+    return None
+
+
+def _active_license_for_email_product_edition(email: str, product_code: str, edition_id: Any = None) -> dict[str, Any] | None:
+    rows = supabase.table("licenses").select("*").eq("client_email", _normalize_email(email)).execute().data or []
+    for row in rows:
+        lic = enrich_license(row)
+        if lic.get("product_code") != normalize_product(product_code):
+            continue
+        if int(lic.get("edition_id") or 0) != int(edition_id or 0):
             continue
         if lic.get("status") == "suspended" or lic.get("days_left", -1) < 0:
             continue
@@ -532,6 +630,11 @@ def enrich_license(lic: dict[str, Any], product_map: dict[str, dict[str, Any]] |
     enriched["days_left"] = days_left
     enriched["display_status"] = display_status
     enriched["used_pcs"] = len(enriched.get("machines") or [])
+    edition = _edition_for_license(enriched)
+    enriched["edition_id"] = edition.get("id")
+    enriched["edition_code"] = edition.get("edition_code")
+    enriched["edition_name"] = edition.get("edition_name")
+    enriched["release_scope"] = edition.get("release_scope")
     return enriched
 
 
@@ -826,6 +929,9 @@ def admin_generate():
     if not product:
         return jsonify({"success": False, "message": f"Product is not registered on license server: {product_code}. Add it from Manage Products first."}), 400
     max_pcs = int(data.get("max_pcs") or product.get("default_limit") or 3)
+    edition = _fetch_edition(data.get("edition_id"))
+    if edition and normalize_product(edition.get("product_code")) != product_code:
+        return jsonify({"success": False, "message": "Selected custom edition does not belong to this software product."}), 400
     key = generate_key(product_code)
     activated_on = today_str()
     expires_on = (date.today() + timedelta(days=validity_days)).isoformat()
@@ -847,6 +953,7 @@ def admin_generate():
         "last_verified": None,
         "status": saved_status,
         "notes": notes_with_type,
+        "edition_id": (edition or {}).get("id"),
     }).execute()
     return jsonify({
         "success": True,
@@ -856,6 +963,7 @@ def admin_generate():
         "expires_on": expires_on,
         "license_mode": license_mode,
         "validity_days": validity_days,
+        "edition": _edition_summary(edition),
         "message": f"{'Trial key' if license_mode == 'trial' else 'License'} generated for {client_name}",
     })
 
@@ -1152,20 +1260,23 @@ def admin_update_channels_add():
 def admin_versions_list():
     denied = _require_admin_json()
     if denied: return denied
-    resp = supabase.table("app_versions").select("*,update_channels(product_code,channel_code,channel_name)").order("created_at", desc=True).execute()
+    resp = supabase.table("app_versions").select("*,update_channels(product_code,channel_code,channel_name),product_editions(edition_code,edition_name,release_scope)").order("created_at", desc=True).execute()
     product_map = get_product_map(include_inactive=True)
     versions = []
-    latest_channels: set[int] = set()
+    latest_groups: set[tuple[int, int]] = set()
     for row in (resp.data or []):
         item = dict(row)
         channel = dict(item.get("update_channels") or {})
         product = product_map.get(normalize_product(channel.get("product_code")))
         channel["product_name"] = (product or {}).get("product_name") or channel.get("product_code") or "Software"
         item["update_channels"] = channel
+        item["edition"] = _edition_summary(dict(item.get("product_editions") or {}) or None)
         channel_id = int(item.get("channel_id") or 0)
-        item["is_latest"] = bool(channel_id and channel_id not in latest_channels)
+        edition_id = int(item.get("edition_id") or 0)
+        group = (channel_id, edition_id)
+        item["is_latest"] = bool(channel_id and group not in latest_groups)
         if channel_id:
-            latest_channels.add(channel_id)
+            latest_groups.add(group)
         versions.append(item)
     return jsonify({"success": True, "versions": versions})
 
@@ -1181,7 +1292,8 @@ def admin_versions_add():
     notes = (data.get("notes") or "").strip()
     if not channel_id or not version or not download_url:
         return jsonify({"success": False, "message": "Channel, version and download URL are required."}), 400
-    payload = {"channel_id": int(channel_id), "version": version, "download_url": download_url, "notes": notes, "mandatory": bool(data.get("mandatory")), "published": True}
+    edition = _fetch_edition(data.get("edition_id"))
+    payload = {"channel_id": int(channel_id), "edition_id": (edition or {}).get("id"), "version": version, "download_url": download_url, "notes": notes, "mandatory": bool(data.get("mandatory")), "published": True}
     supabase.table("app_versions").insert(payload).execute()
     _write_log("app_version_published", payload, request)
     return jsonify({"success": True, "message": "External-link version published successfully.", "version": payload})
@@ -1252,6 +1364,7 @@ def admin_storage_presign_upload():
         filename = _safe_app_filename(data.get("filename") or "")
         content_type = (data.get("content_type") or "application/octet-stream").strip()
         size_bytes = int(data.get("size_bytes") or 0)
+        edition_id = int(data.get("edition_id") or 0)
     except (TypeError, ValueError) as exc:
         return jsonify({"success": False, "message": str(exc)}), 400
     if not channel_id or not version:
@@ -1264,7 +1377,11 @@ def admin_storage_presign_upload():
     if not channel_rows:
         return jsonify({"success": False, "message": "Update channel not found."}), 404
     channel = channel_rows[0]
-    storage_key = _new_storage_key(channel, version, filename)
+    edition = _fetch_edition(edition_id)
+    if edition and normalize_product(edition.get("product_code")) != normalize_product(channel.get("product_code")):
+        return jsonify({"success": False, "message": "Selected edition does not belong to this software product."}), 400
+    edition_summary = _edition_summary(edition)
+    storage_key = _new_storage_key(channel, version, filename, edition_summary.get("edition_code") or "STANDARD")
     try:
         upload_url = _r2_presigned_put(storage_key, content_type)
     except Exception as exc:
@@ -1274,6 +1391,7 @@ def admin_storage_presign_upload():
         "success": True,
         "upload_url": upload_url,
         "storage_key": storage_key,
+        "edition": edition_summary,
         "headers": {"Content-Type": content_type},
         "expires_in": R2_UPLOAD_URL_SECONDS,
         "message": "Secure upload URL created.",
@@ -1290,8 +1408,9 @@ def admin_storage_publish_upload():
     try:
         channel_id = int(data.get("channel_id") or 0)
         size_bytes = int(data.get("size_bytes") or 0)
+        edition_id = int(data.get("edition_id") or 0)
     except (TypeError, ValueError):
-        return jsonify({"success": False, "message": "Invalid channel or file size."}), 400
+        return jsonify({"success": False, "message": "Invalid channel, edition or file size."}), 400
     version = (data.get("version") or "").strip()
     storage_key = (data.get("storage_key") or "").strip()
     original_filename = _safe_app_filename(data.get("original_filename") or "")
@@ -1307,8 +1426,15 @@ def admin_storage_publish_upload():
     except Exception as exc:
         return jsonify({"success": False, "message": "Uploaded file could not be verified in cloud storage.", "error": str(exc)}), 400
     auth = _current_user(request) or {}
+    edition = _fetch_edition(edition_id)
+    channel_rows = supabase.table("update_channels").select("*").eq("id", channel_id).limit(1).execute().data or []
+    if not channel_rows:
+        return jsonify({"success": False, "message": "Update channel not found."}), 404
+    if edition and normalize_product(edition.get("product_code")) != normalize_product(channel_rows[0].get("product_code")):
+        return jsonify({"success": False, "message": "Selected edition does not belong to this software product."}), 400
     payload = {
         "channel_id": channel_id,
+        "edition_id": (edition or {}).get("id"),
         "version": version,
         "download_url": f"r2://{R2_BUCKET_NAME}/{storage_key}",
         "notes": notes,
@@ -1324,10 +1450,10 @@ def admin_storage_publish_upload():
     try:
         created = supabase.table("app_versions").insert(payload).execute().data or []
     except Exception as exc:
-        return jsonify({"success": False, "message": "Could not publish this upload. Run the latest Phase 2 SQL file first, or use a different version number.", "error": str(exc)}), 500
+        return jsonify({"success": False, "message": "Could not publish this upload. Run the latest Phase 3 SQL file first, or use a different version number.", "error": str(exc)}), 500
     cleanup = {"removed": [], "failed": [], "keep_count": APP_VERSION_RETENTION_COUNT}
     if AUTO_DELETE_OLDER_VERSIONS:
-        cleanup = _cleanup_old_cloud_versions(channel_id, APP_VERSION_RETENTION_COUNT)
+        cleanup = _cleanup_old_cloud_versions(channel_id, APP_VERSION_RETENTION_COUNT, (edition or {}).get("id"))
     _write_log("central_app_version_uploaded", {**payload, "cleanup": cleanup}, request)
     removed_count = len(cleanup.get("removed") or [])
     message = "App uploaded and published successfully."
@@ -1408,19 +1534,16 @@ def customer_dashboard():
     licenses_resp = supabase.table("licenses").select("*").eq("client_email", email).order("activated_on", desc=True).execute()
     licenses = [enrich_license(row) for row in (licenses_resp.data or [])]
     channels = supabase.table("update_channels").select("*").eq("status", "active").execute().data or []
-    versions = supabase.table("app_versions").select("*").eq("published", True).order("created_at", desc=True).execute().data or []
-    latest_by_channel = {}
-    for version in versions:
-        latest_by_channel.setdefault(version.get("channel_id"), _version_response(version, include_presigned_download=False))
     products = []
     for lic in licenses:
         product_channels = []
         for channel in channels:
             if slug_code(channel.get("product_code") or "") == lic.get("product_code"):
                 item = dict(channel)
-                item["latest_version"] = latest_by_channel.get(channel.get("id"))
+                _, latest = _latest_channel_version(lic.get("product_code"), channel.get("channel_code"), lic.get("edition_id"))
+                item["latest_version"] = _version_response(latest, include_presigned_download=False)
                 product_channels.append(item)
-        products.append({"license": lic, "channels": product_channels})
+        products.append({"license": lic, "edition": _edition_for_license(lic), "channels": product_channels})
     return jsonify({"success": True, "email": email, "products": products})
 
 
@@ -1435,8 +1558,13 @@ def customer_download(version_id: int):
     version = rows[0]
     channel = dict(version.get("update_channels") or {})
     product_code = normalize_product(channel.get("product_code"))
-    if auth.get("role") != "admin" and not _active_license_for_email_product(auth.get("email") or "", product_code):
-        return jsonify({"success": False, "message": "This software is not assigned to your active customer account."}), 403
+    lic = None
+    if auth.get("role") != "admin":
+        lic = _active_license_for_email_product_edition(auth.get("email") or "", product_code, version.get("edition_id"))
+        if not lic:
+            return jsonify({"success": False, "message": "This software is not assigned to your active customer account."}), 403
+        if int(version.get("edition_id") or 0) != int(lic.get("edition_id") or 0):
+            return jsonify({"success": False, "message": "This download belongs to a different customer edition."}), 403
     storage_key = (version.get("storage_key") or "").strip()
     if storage_key:
         if not _r2_is_configured():
@@ -1446,165 +1574,27 @@ def customer_download(version_id: int):
         url = (version.get("download_url") or "").strip()
         if not url.lower().startswith(("https://", "http://")):
             return jsonify({"success": False, "message": "Download link is not configured."}), 404
-    _write_log("customer_app_download", {"version_id": version_id, "product_code": product_code, "email": auth.get("email")}, request)
+    _write_log("customer_app_download", {"version_id": version_id, "product_code": product_code, "edition_id": version.get("edition_id"), "email": auth.get("email")}, request)
     return redirect(url, code=302)
 
 
-def _latest_channel_version(product_code: str, channel_code: str):
+def _latest_channel_version(product_code: str, channel_code: str, edition_id: Any = None):
     product_code = normalize_product(product_code)
     channel_code = channel_slug(channel_code)
     channel_rows = supabase.table("update_channels").select("*").eq("product_code", product_code).eq("channel_code", channel_code).limit(1).execute().data or []
     channel = (channel_rows or [None])[0]
     if not channel:
-        # Backward compatibility for any earlier rows saved with truncated codes.
         possible = supabase.table("update_channels").select("*").eq("product_code", product_code).execute().data or []
         channel = next((row for row in possible if channel_slug(row.get("channel_code")) == channel_code), None)
     if not channel:
         return None, None
-    versions = supabase.table("app_versions").select("*").eq("channel_id", channel.get("id")).eq("published", True).order("created_at", desc=True).limit(1).execute().data or []
+    query = supabase.table("app_versions").select("*").eq("channel_id", channel.get("id")).eq("published", True)
+    if edition_id:
+        query = query.eq("edition_id", int(edition_id))
+    else:
+        query = query.is_("edition_id", "null")
+    versions = query.order("created_at", desc=True).limit(1).execute().data or []
     return channel, (versions or [None])[0]
-
-
-
-
-def _edu_prime_school_license_status(school_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Return current central EDU PRIME master-license status for one school.
-
-    Mobile apps never receive or store the paid license key. The Desktop App
-    activates the master key once and links it to the school's cloud ID.
-    """
-    normalized_school_id = (school_id or "").strip()
-    if not normalized_school_id:
-        return None, "School ID is required."
-    try:
-        rows = (
-            supabase.table("edu_prime_school_licenses")
-            .select("*")
-            .eq("school_id", normalized_school_id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-    except Exception as exc:
-        return None, f"EDU PRIME master-license table is not ready. Run the latest Phase 2.3 SQL file first. ({exc})"
-    if not rows:
-        return None, "This school's EDU PRIME master license has not been linked from the Desktop App yet."
-    binding = dict(rows[0])
-    key = (binding.get("license_key") or "").strip().upper()
-    lic = get_license_by_key(key)
-    if not lic:
-        return None, "The linked EDU PRIME master license was not found."
-    if lic.get("product_code") != "EDUPRIME":
-        return None, "The linked license is not an EDU PRIME master license."
-    if (lic.get("status") or "active").lower() not in ("active", "trial"):
-        return None, "The school's EDU PRIME master license is suspended. Please contact Tezhisab support."
-    if int(lic.get("days_left") if lic.get("days_left") is not None else -1) < 0:
-        return None, f"The school's EDU PRIME master license expired on {lic.get('expires_on') or ''}. Please renew."
-    payload = {
-        "school_id": normalized_school_id,
-        "school_name": binding.get("school_name") or lic.get("client_name") or "EDU PRIME School",
-        "client_email": binding.get("client_email") or lic.get("client_email") or "",
-        "license_status": lic.get("status") or "active",
-        "expires_on": lic.get("expires_on") or "",
-        "days_left": int(lic.get("days_left") or 0),
-        "last_verified_at": datetime.utcnow().isoformat() + "Z",
-    }
-    try:
-        supabase.table("edu_prime_school_licenses").update({
-            "school_name": payload["school_name"],
-            "client_email": payload["client_email"],
-            "license_status": payload["license_status"],
-            "expires_on": payload["expires_on"],
-            "last_verified_at": payload["last_verified_at"],
-            "updated_at": payload["last_verified_at"],
-        }).eq("school_id", normalized_school_id).execute()
-    except Exception:
-        pass
-    return payload, None
-
-
-@app.route("/api/v2/edu-prime/school-license/link", methods=["POST"])
-def edu_prime_school_license_link():
-    """Link one activated EDU PRIME desktop master license to one school ID."""
-    data = request.get_json(silent=True) or {}
-    key = (data.get("license_key") or data.get("key") or "").strip().upper()
-    school_id = (data.get("school_id") or "").strip()
-    school_name = (data.get("school_name") or "").strip()
-    machine_id = (data.get("machine_id") or "").strip()
-    if not key or not school_id or not machine_id:
-        return jsonify({"success": False, "message": "License key, School ID and Machine ID are required."}), 400
-    lic = get_license_by_key(key)
-    if not lic:
-        return jsonify({"success": False, "message": "License key not found."}), 404
-    if lic.get("product_code") != "EDUPRIME":
-        return jsonify({"success": False, "message": "This license key is not valid for EDU PRIME."}), 403
-    if (lic.get("status") or "active").lower() not in ("active", "trial") or int(lic.get("days_left") or -1) < 0:
-        return jsonify({"success": False, "message": "This EDU PRIME master license is inactive or expired."}), 403
-    machines = lic.get("machines") or []
-    if machine_id not in {m.get("id") for m in machines}:
-        return jsonify({"success": False, "message": "Activate this Desktop App with the EDU PRIME license before linking the school."}), 403
-    now_value = datetime.utcnow().isoformat() + "Z"
-    payload = {
-        "school_id": school_id,
-        "school_name": school_name or lic.get("client_name") or "EDU PRIME School",
-        "license_key": key,
-        "client_email": lic.get("client_email") or "",
-        "desktop_machine_id": machine_id,
-        "license_status": lic.get("status") or "active",
-        "expires_on": lic.get("expires_on") or "",
-        "last_verified_at": now_value,
-        "updated_at": now_value,
-    }
-    try:
-        supabase.table("edu_prime_school_licenses").upsert(payload, on_conflict="school_id").execute()
-    except Exception as exc:
-        return jsonify({"success": False, "message": "Could not link school master license. Run the latest Phase 2.3 SQL file first.", "error": str(exc)}), 500
-    _write_log("edu_prime_school_master_license_linked", {"school_id": school_id, "client_email": payload["client_email"], "machine_id": machine_id}, request)
-    return jsonify({"success": True, "message": "EDU PRIME master license linked to this school successfully.", "school_license": {k: v for k, v in payload.items() if k != "license_key"}})
-
-
-@app.route("/api/v2/edu-prime/school-license/check", methods=["GET", "POST"])
-def edu_prime_school_license_check():
-    """Mobile-safe school master-license check. The paid key is never returned."""
-    data = request.get_json(silent=True) or request.args
-    status, error = _edu_prime_school_license_status((data.get("school_id") or "").strip())
-    if not status:
-        return jsonify({"success": False, "active": False, "message": error or "EDU PRIME master license is not active."}), 403
-    return jsonify({"success": True, "active": True, "message": "School master license is active.", "school_license": status})
-
-
-@app.route("/api/v2/edu-prime/mobile-updates/check", methods=["GET", "POST"])
-def edu_prime_mobile_updates_check():
-    """Secure Teacher / Parent / Admin APK update check through the school master license."""
-    data = request.get_json(silent=True) or request.args
-    school_id = (data.get("school_id") or "").strip()
-    app_type = (data.get("app_type") or "").strip().lower()
-    current_version = (data.get("current_version") or "").strip()
-    status, error = _edu_prime_school_license_status(school_id)
-    if not status:
-        return jsonify({"success": False, "active": False, "message": error or "School master license is inactive."}), 403
-    channel_code = {
-        "teacher": "ANDROID_TEACHER_APK",
-        "parent": "ANDROID_PARENT_APK",
-        "admin": "ANDROID_ADMIN_APK",
-    }.get(app_type)
-    if not channel_code:
-        return jsonify({"success": False, "message": "App type must be teacher, parent or admin."}), 400
-    channel, latest = _latest_channel_version("EDUPRIME", channel_code)
-    if not channel:
-        return jsonify({"success": False, "message": "EDU PRIME mobile update channel is not configured."}), 404
-    secure_latest = _version_response(latest, include_presigned_download=True)
-    return jsonify({
-        "success": True,
-        "active": True,
-        "school_id": school_id,
-        "app_type": app_type,
-        "current_version": current_version,
-        "latest": secure_latest,
-        "update_available": bool(latest and latest.get("version") != current_version),
-        "license_expires_on": status.get("expires_on"),
-    })
 
 @app.route("/updates/check", methods=["GET"])
 def updates_check():
@@ -1642,7 +1632,11 @@ def secure_updates_check():
     machines = lic.get("machines") or []
     if machine_id and machines and machine_id not in {m.get("id") for m in machines}:
         return jsonify({"success": False, "message": "This computer is not activated for the license."}), 403
-    channel, latest = _latest_channel_version(product_code, channel_code)
+    edition = _edition_for_license(lic)
+    requested_edition = _edition_code(data.get("edition_code") or data.get("variant") or edition.get("edition_code"))
+    if requested_edition not in {"STANDARD", _edition_code(edition.get("edition_code"))}:
+        return jsonify({"success": False, "message": "This license is assigned to a different software edition."}), 403
+    channel, latest = _latest_channel_version(product_code, channel_code, lic.get("edition_id"))
     if not channel:
         return jsonify({"success": False, "message": "Update channel not configured."}), 404
     secure_latest = _version_response(latest, include_presigned_download=True)
@@ -1650,6 +1644,7 @@ def secure_updates_check():
         "success": True,
         "product": product_code,
         "channel": channel_code,
+        "edition": edition,
         "current_version": current_version,
         "latest": secure_latest,
         "update_available": bool(latest and latest.get("version") != current_version),
@@ -1657,6 +1652,383 @@ def secure_updates_check():
         "license_expires_on": lic.get("expires_on"),
     })
 
+
+
+# ---------------------------------------------------------------------------
+# Tezhisab Central Platform — Phase 3
+# Customer self-registration, requirement workflow, custom product editions,
+# customer-specific releases and tutorial video manager.
+# ---------------------------------------------------------------------------
+
+def _safe_customer_public(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: row.get(k) for k in ("id", "name", "email", "phone", "business_name", "status", "created_at", "approved_at", "approved_by", "rejection_reason")}
+
+
+def _customer_by_email(email: str) -> dict[str, Any] | None:
+    rows = supabase.table("customers").select("*").eq("email", _normalize_email(email)).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def _customer_for_auth(auth: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not auth:
+        return None
+    if auth.get("customer_id"):
+        rows = supabase.table("customers").select("*").eq("id", int(auth.get("customer_id"))).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+    return _customer_by_email(auth.get("email") or "")
+
+
+def _require_customer_auth() -> tuple[dict[str, Any] | None, Any]:
+    auth = _current_user(request)
+    if not auth or auth.get("role") not in ("customer", "admin"):
+        return None, (jsonify({"success": False, "message": "Customer login required."}), 401)
+    return auth, None
+
+
+def _issue_requirement_upload_ticket(storage_key: str, email: str) -> str:
+    payload = {"storage_key": storage_key, "email": _normalize_email(email), "exp": int(time.time()) + 1800}
+    body = _b64encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+
+def _read_requirement_upload_ticket(ticket: str | None, email: str) -> dict[str, Any] | None:
+    try:
+        body, sig = (ticket or "").split(".", 1)
+        expected = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(_b64decode(body).decode())
+        if int(payload.get("exp") or 0) < int(time.time()):
+            return None
+        if _normalize_email(payload.get("email")) != _normalize_email(email):
+            return None
+        if not (payload.get("storage_key") or "").startswith("requirements/"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _attachment_ticket(data: dict[str, Any], email: str) -> tuple[dict[str, Any] | None, Any]:
+    if not _r2_is_configured():
+        return None, (jsonify({"success": False, "message": "Attachment storage is not configured yet. Submit the written requirement without an attachment, or contact Tezhisab support."}), 503)
+    try:
+        filename = _safe_requirement_filename(data.get("filename") or "")
+        content_type = (data.get("content_type") or "application/octet-stream").strip()
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError) as exc:
+        return None, (jsonify({"success": False, "message": str(exc)}), 400)
+    if size_bytes <= 0:
+        return None, (jsonify({"success": False, "message": "Selected attachment is empty."}), 400)
+    if size_bytes > MAX_REQUIREMENT_UPLOAD_MB * 1024 * 1024:
+        return None, (jsonify({"success": False, "message": f"Attachment is larger than the {MAX_REQUIREMENT_UPLOAD_MB} MB limit."}), 400)
+    storage_key = _new_requirement_storage_key(email, filename)
+    upload_url = _r2_presigned_put(storage_key, content_type)
+    return {"success": True, "upload_url": upload_url, "storage_key": storage_key, "attachment_ticket": _issue_requirement_upload_ticket(storage_key, email), "headers": {"Content-Type": content_type}, "expires_in": R2_UPLOAD_URL_SECONDS}, None
+
+
+def _requirement_payload(data: dict[str, Any], customer: dict[str, Any] | None, submitted_by: str, request_type: str = "software_requirement") -> dict[str, Any]:
+    return {
+        "customer_id": (customer or {}).get("id"),
+        "submitted_by_email": _normalize_email(submitted_by),
+        "contact_name": (data.get("contact_name") or (customer or {}).get("name") or "").strip(),
+        "business_name": (data.get("business_name") or (customer or {}).get("business_name") or "").strip(),
+        "phone": (data.get("phone") or (customer or {}).get("phone") or "").strip(),
+        "product_code": normalize_product(data.get("product_code")) if data.get("product_code") else "",
+        "request_type": request_type,
+        "title": (data.get("title") or "Software requirement").strip(),
+        "details": (data.get("details") or "").strip(),
+        "status": "pending",
+        "attachment_storage_key": (data.get("attachment_storage_key") or "").strip() if (data.get("attachment_storage_key") or "").strip().startswith("requirements/") else "",
+        "attachment_filename": _safe_requirement_filename(data.get("attachment_filename")) if data.get("attachment_filename") else "",
+        "attachment_content_type": (data.get("attachment_content_type") or "").strip(),
+        "attachment_size_bytes": int(data.get("attachment_size_bytes") or 0),
+    }
+
+
+def _safe_requirement(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["has_attachment"] = bool((item.get("attachment_storage_key") or "").strip())
+    item.pop("attachment_storage_key", None)
+    return item
+
+
+@app.route("/public/config", methods=["GET"])
+def public_config():
+    return jsonify({
+        "success": True,
+        "brand": BRAND_NAME,
+        "turnstile_site_key": TURNSTILE_SITE_KEY,
+        "turnstile_enabled": bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY),
+        "max_requirement_upload_mb": MAX_REQUIREMENT_UPLOAD_MB,
+    })
+
+
+@app.route("/public/products", methods=["GET"])
+def public_products():
+    products = [p for p in fetch_products() if p.get("status") == "active" and p.get("customer_portal_visible", True)]
+    return jsonify({"success": True, "products": products})
+
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    email = _normalize_email(data.get("email"))
+    upload_key = (data.get("attachment_storage_key") or "").strip()
+    upload_ticket = _read_requirement_upload_ticket(data.get("attachment_ticket"), email) if upload_key else None
+    if upload_key and (not upload_ticket or upload_ticket.get("storage_key") != upload_key):
+        return jsonify({"success": False, "message": "Attachment upload authorization expired. Please select and upload the attachment again."}), 400
+    if not upload_key:
+        ok, message = _verify_turnstile(data.get("turnstile_token"), request.remote_addr)
+        if not ok:
+            return jsonify({"success": False, "message": message}), 400
+    password = data.get("password") or ""
+    phone = (data.get("phone") or "").strip()
+    business_name = (data.get("business_name") or "").strip()
+    details = (data.get("details") or "").strip()
+    if not name or not email or len(password) < 8:
+        return jsonify({"success": False, "message": "Name, email and password of at least 8 characters are required."}), 400
+    if not details:
+        return jsonify({"success": False, "message": "Please describe your software requirement."}), 400
+    try:
+        if _customer_by_email(email) or (supabase.table("portal_users").select("email").eq("email", email).limit(1).execute().data or []):
+            return jsonify({"success": False, "message": "An account already exists for this email. Please login or contact Tezhisab support."}), 409
+        customer_payload = {"name": name, "email": email, "phone": phone, "business_name": business_name, "status": "pending"}
+        created = supabase.table("customers").insert(customer_payload).execute().data or []
+        customer = created[0] if created else _customer_by_email(email)
+        supabase.table("portal_users").insert({"email": email, "password_hash": _hash_password(password), "role": "customer", "display_name": name, "customer_id": (customer or {}).get("id"), "status": "pending"}).execute()
+        requirement = _requirement_payload(data, customer, email, "new_customer_registration")
+        requirement["title"] = (data.get("title") or "New customer software request").strip()
+        supabase.table("customer_requirements").insert(requirement).execute()
+        _write_log("customer_self_registered", {"email": email, "customer_id": (customer or {}).get("id")}, request)
+        return jsonify({"success": True, "message": "Registration submitted successfully. Tezhisab will review your requirement and approve your customer login."})
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not submit registration. Run the latest Phase 3 SQL in Supabase SQL Editor first.", "error": str(exc)}), 500
+
+
+@app.route("/public/requirements/presign-upload", methods=["POST"])
+def public_requirement_presign_upload():
+    data = request.json or {}
+    ok, message = _verify_turnstile(data.get("turnstile_token"), request.remote_addr)
+    if not ok:
+        return jsonify({"success": False, "message": message}), 400
+    email = _normalize_email(data.get("email"))
+    if not email:
+        return jsonify({"success": False, "message": "Enter your email before uploading an attachment."}), 400
+    ticket, denied = _attachment_ticket(data, email)
+    return denied or jsonify(ticket)
+
+
+@app.route("/customer/requirements/presign-upload", methods=["POST"])
+def customer_requirement_presign_upload():
+    auth, denied = _require_customer_auth()
+    if denied: return denied
+    ticket, error = _attachment_ticket(request.json or {}, auth.get("email") or "customer")
+    return error or jsonify(ticket)
+
+
+@app.route("/customer/requirements", methods=["GET", "POST"])
+def customer_requirements():
+    auth, denied = _require_customer_auth()
+    if denied: return denied
+    customer = _customer_for_auth(auth)
+    if request.method == "GET":
+        query = supabase.table("customer_requirements").select("*")
+        if customer and customer.get("id"):
+            query = query.eq("customer_id", customer.get("id"))
+        else:
+            query = query.eq("submitted_by_email", _normalize_email(auth.get("email")))
+        rows = query.order("created_at", desc=True).execute().data or []
+        return jsonify({"success": True, "requirements": [_safe_requirement(row) for row in rows]})
+    data = request.json or {}
+    if not (data.get("details") or "").strip():
+        return jsonify({"success": False, "message": "Requirement details are required."}), 400
+    payload = _requirement_payload(data, customer, auth.get("email") or "")
+    created = supabase.table("customer_requirements").insert(payload).execute().data or []
+    _write_log("customer_requirement_submitted", {"customer_id": (customer or {}).get("id"), "product_code": payload.get("product_code")}, request)
+    return jsonify({"success": True, "message": "Requirement submitted successfully.", "requirement": _safe_requirement((created or [payload])[0])})
+
+
+@app.route("/admin/registration-requests", methods=["GET"])
+def admin_registration_requests():
+    denied = _require_admin_json()
+    if denied: return denied
+    rows = supabase.table("customers").select("*").eq("status", "pending").order("created_at", desc=True).execute().data or []
+    return jsonify({"success": True, "requests": [_safe_customer_public(row) for row in rows]})
+
+
+@app.route("/admin/registration-requests/<int:customer_id>/status", methods=["POST"])
+def admin_registration_request_status(customer_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    status = (data.get("status") or "").strip().lower()
+    if status not in {"active", "rejected"}:
+        return jsonify({"success": False, "message": "Status must be active or rejected."}), 400
+    rows = supabase.table("customers").select("*").eq("id", customer_id).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Customer request not found."}), 404
+    customer = rows[0]
+    auth = _current_user(request) or {}
+    payload = {"status": status, "approved_at": datetime.utcnow().isoformat()+"Z" if status == "active" else None, "approved_by": auth.get("email") or "admin", "rejection_reason": (data.get("reason") or "").strip()}
+    supabase.table("customers").update(payload).eq("id", customer_id).execute()
+    supabase.table("portal_users").update({"status": status}).eq("email", _normalize_email(customer.get("email"))).execute()
+    _write_log("customer_registration_status_changed", {"customer_id": customer_id, "status": status}, request)
+    return jsonify({"success": True, "message": "Customer login approved successfully." if status == "active" else "Customer request rejected."})
+
+
+@app.route("/admin/requirements", methods=["GET"])
+def admin_requirements_list():
+    denied = _require_admin_json()
+    if denied: return denied
+    rows = supabase.table("customer_requirements").select("*").order("created_at", desc=True).execute().data or []
+    return jsonify({"success": True, "requirements": [_safe_requirement(row) for row in rows]})
+
+
+@app.route("/admin/requirements/<int:requirement_id>/status", methods=["POST"])
+def admin_requirement_status(requirement_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    data = request.json or {}
+    status = (data.get("status") or "").strip().lower()
+    if status not in {"pending", "reviewing", "approved", "completed", "rejected"}:
+        return jsonify({"success": False, "message": "Invalid requirement status."}), 400
+    auth = _current_user(request) or {}
+    payload = {"status": status, "admin_notes": (data.get("admin_notes") or "").strip(), "reviewed_by": auth.get("email") or "admin", "reviewed_at": datetime.utcnow().isoformat()+"Z"}
+    supabase.table("customer_requirements").update(payload).eq("id", requirement_id).execute()
+    _write_log("customer_requirement_status_changed", {"requirement_id": requirement_id, "status": status}, request)
+    return jsonify({"success": True, "message": f"Requirement marked as {status}."})
+
+
+def _requirement_attachment_redirect(requirement_id: int, auth: dict[str, Any]):
+    rows = supabase.table("customer_requirements").select("*").eq("id", requirement_id).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Attachment not found."}), 404
+    item = rows[0]
+    if auth.get("role") != "admin":
+        customer = _customer_for_auth(auth)
+        if not customer or int(item.get("customer_id") or 0) != int(customer.get("id") or 0):
+            return jsonify({"success": False, "message": "This attachment does not belong to your account."}), 403
+    key = (item.get("attachment_storage_key") or "").strip()
+    if not key or not _r2_is_configured():
+        return jsonify({"success": False, "message": "Attachment is unavailable."}), 404
+    return redirect(_r2_presigned_get(key), code=302)
+
+
+@app.route("/admin/requirements/<int:requirement_id>/attachment", methods=["GET"])
+def admin_requirement_attachment(requirement_id: int):
+    auth = _portal_user_from_request(request)
+    if not auth or auth.get("role") != "admin":
+        return jsonify({"success": False, "message": "Admin login required."}), 401
+    return _requirement_attachment_redirect(requirement_id, auth)
+
+
+@app.route("/customer/requirements/<int:requirement_id>/attachment", methods=["GET"])
+def customer_requirement_attachment(requirement_id: int):
+    auth = _portal_user_from_request(request)
+    if not auth or auth.get("role") not in ("customer", "admin"):
+        return jsonify({"success": False, "message": "Customer login required."}), 401
+    return _requirement_attachment_redirect(requirement_id, auth)
+
+
+@app.route("/admin/editions", methods=["GET", "POST"])
+def admin_editions():
+    denied = _require_admin_json()
+    if denied: return denied
+    if request.method == "GET":
+        rows = supabase.table("product_editions").select("*,customers(name,email,business_name)").order("created_at", desc=True).execute().data or []
+        return jsonify({"success": True, "editions": rows})
+    data = request.json or {}
+    product_code = normalize_product(data.get("product_code"))
+    edition_name = (data.get("edition_name") or "").strip()
+    edition_code = _edition_code(data.get("edition_code") or edition_name)
+    release_scope = (data.get("release_scope") or "customer_specific").strip()
+    customer_id = int(data.get("customer_id") or 0) or None
+    if not find_product(product_code, include_inactive=True) or not edition_name:
+        return jsonify({"success": False, "message": "Software product and edition name are required."}), 400
+    if release_scope not in {"customer_specific", "selected_customers"}:
+        return jsonify({"success": False, "message": "Edition scope must be customer_specific or selected_customers."}), 400
+    if release_scope == "customer_specific" and not customer_id:
+        return jsonify({"success": False, "message": "Select the customer for this custom edition."}), 400
+    payload = {"product_code": product_code, "edition_code": edition_code, "edition_name": edition_name, "release_scope": release_scope, "customer_id": customer_id, "status": "active", "notes": (data.get("notes") or "").strip()}
+    created = supabase.table("product_editions").insert(payload).execute().data or []
+    edition = (created or [payload])[0]
+    if customer_id and edition.get("id"):
+        supabase.table("edition_customers").upsert({"edition_id": edition.get("id"), "customer_id": customer_id}, on_conflict="edition_id,customer_id").execute()
+    _write_log("custom_edition_created", payload, request)
+    return jsonify({"success": True, "message": "Customer-specific edition created successfully.", "edition": edition})
+
+
+@app.route("/admin/editions/<int:edition_id>/status", methods=["POST"])
+def admin_edition_status(edition_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    status = ((request.json or {}).get("status") or "").strip().lower()
+    if status not in {"active", "inactive"}:
+        return jsonify({"success": False, "message": "Status must be active or inactive."}), 400
+    supabase.table("product_editions").update({"status": status}).eq("id", edition_id).execute()
+    return jsonify({"success": True, "message": f"Edition marked as {status}."})
+
+
+def _tutorial_rows(public_only: bool = False, customer_id: int | None = None):
+    rows = supabase.table("tutorial_videos").select("*").eq("status", "active").order("sort_order").execute().data or []
+    result = []
+    for row in rows:
+        visibility = (row.get("visibility") or "public").lower()
+        if public_only and visibility != "public":
+            continue
+        if not public_only and visibility == "selected_customer" and int(row.get("customer_id") or 0) != int(customer_id or 0):
+            continue
+        result.append(row)
+    return result
+
+
+@app.route("/public/tutorials", methods=["GET"])
+def public_tutorials():
+    return jsonify({"success": True, "tutorials": _tutorial_rows(public_only=True)})
+
+
+@app.route("/customer/tutorials", methods=["GET"])
+def customer_tutorials():
+    auth, denied = _require_customer_auth()
+    if denied: return denied
+    customer = _customer_for_auth(auth)
+    return jsonify({"success": True, "tutorials": _tutorial_rows(public_only=False, customer_id=(customer or {}).get("id"))})
+
+
+@app.route("/admin/tutorials", methods=["GET", "POST"])
+def admin_tutorials():
+    denied = _require_admin_json()
+    if denied: return denied
+    if request.method == "GET":
+        rows = supabase.table("tutorial_videos").select("*,customers(name,email)").order("sort_order").execute().data or []
+        return jsonify({"success": True, "tutorials": rows})
+    data = request.json or {}
+    title = (data.get("title") or "").strip()
+    video_url = (data.get("video_url") or "").strip()
+    visibility = (data.get("visibility") or "public").strip().lower()
+    customer_id = int(data.get("customer_id") or 0) or None
+    if not title or not video_url.lower().startswith(("https://", "http://")):
+        return jsonify({"success": False, "message": "Tutorial title and valid video URL are required."}), 400
+    if visibility not in {"public", "customer_only", "selected_customer"}:
+        return jsonify({"success": False, "message": "Invalid tutorial visibility."}), 400
+    if visibility == "selected_customer" and not customer_id:
+        return jsonify({"success": False, "message": "Select a customer for a customer-specific tutorial."}), 400
+    payload = {"title": title, "product_code": normalize_product(data.get("product_code")) if data.get("product_code") else "", "category": (data.get("category") or "Tutorial").strip(), "video_url": video_url, "thumbnail_url": (data.get("thumbnail_url") or "").strip(), "visibility": visibility, "customer_id": customer_id, "sort_order": int(data.get("sort_order") or 100), "status": "active", "description": (data.get("description") or "").strip()}
+    created = supabase.table("tutorial_videos").insert(payload).execute().data or []
+    _write_log("tutorial_video_created", payload, request)
+    return jsonify({"success": True, "message": "Tutorial video added successfully.", "tutorial": (created or [payload])[0]})
+
+
+@app.route("/admin/tutorials/<int:tutorial_id>", methods=["DELETE"])
+def admin_tutorial_delete(tutorial_id: int):
+    denied = _require_admin_json()
+    if denied: return denied
+    supabase.table("tutorial_videos").delete().eq("id", tutorial_id).execute()
+    return jsonify({"success": True, "message": "Tutorial video deleted successfully."})
 
 @app.route("/admin/activity-logs", methods=["GET"])
 def admin_activity_logs():
