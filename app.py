@@ -50,6 +50,9 @@ AUTO_DELETE_OLDER_VERSIONS = os.environ.get("AUTO_DELETE_OLDER_VERSIONS", "true"
 ALLOWED_APP_EXTENSIONS = {".exe", ".apk", ".msi", ".zip"}
 ALLOWED_REQUIREMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt", ".zip"}
 MAX_REQUIREMENT_UPLOAD_MB = int(os.environ.get("MAX_REQUIREMENT_UPLOAD_MB", "15"))
+MAX_RECHARGE_SCREENSHOT_MB = int(os.environ.get("MAX_RECHARGE_SCREENSHOT_MB", "5"))
+ALLOWED_RECHARGE_SCREENSHOT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
+BANK_IMPORT_PRODUCT_CODE = "BIP"
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -261,6 +264,23 @@ def _safe_requirement_filename(filename: str) -> str:
         raise ValueError("Allowed attachments: PDF, image, Word, Excel, CSV, TXT or ZIP.")
     return clean
 
+
+
+def _safe_recharge_screenshot_filename(filename: str) -> str:
+    clean = secure_filename(filename or "")
+    if not clean:
+        raise ValueError("Select a valid payment screenshot or PDF receipt.")
+    suffix = Path(clean).suffix.lower()
+    if suffix not in ALLOWED_RECHARGE_SCREENSHOT_EXTENSIONS:
+        raise ValueError("Allowed payment proofs: PNG, JPG, WEBP or PDF.")
+    return clean
+
+
+def _new_recharge_screenshot_storage_key(email: str, filename: str) -> str:
+    customer_piece = _clean_path_piece(_normalize_email(email).replace("@", "-at-"), "customer").lower()
+    safe_name = _safe_recharge_screenshot_filename(filename)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return f"bank-import/recharge-proofs/{customer_piece}/{stamp}_{secrets.token_hex(4)}_{safe_name}"
 
 def _new_requirement_storage_key(email: str, filename: str) -> str:
     customer_piece = _clean_path_piece(_normalize_email(email).replace("@", "-at-"), "visitor").lower()
@@ -1763,6 +1783,7 @@ def public_config():
         "turnstile_site_key": TURNSTILE_SITE_KEY,
         "turnstile_enabled": bool(TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY),
         "max_requirement_upload_mb": MAX_REQUIREMENT_UPLOAD_MB,
+        "max_recharge_screenshot_mb": MAX_RECHARGE_SCREENSHOT_MB,
     })
 
 
@@ -2029,6 +2050,428 @@ def admin_tutorial_delete(tutorial_id: int):
     if denied: return denied
     supabase.table("tutorial_videos").delete().eq("id", tutorial_id).execute()
     return jsonify({"success": True, "message": "Tutorial video deleted successfully."})
+
+
+
+# ---------------------------------------------------------------------------
+# Tezhisab Central Platform — Phase 4
+# Bank Import Pro manual recharge wallet. Only commercial wallet metadata is
+# stored in cloud. Tally ledgers, narration groups, mappings and accounting
+# entries remain local to the customer's connector PC.
+# ---------------------------------------------------------------------------
+
+def _wallet_for_customer(customer_id: int, create_if_missing: bool = True) -> dict[str, Any] | None:
+    rows = supabase.table("bank_import_wallets").select("*").eq("customer_id", int(customer_id)).limit(1).execute().data or []
+    if rows:
+        return rows[0]
+    if not create_if_missing:
+        return None
+    payload = {
+        "customer_id": int(customer_id),
+        "page_balance": 0,
+        "total_pages_credited": 0,
+        "total_pages_used": 0,
+        "status": "active",
+    }
+    created = supabase.table("bank_import_wallets").insert(payload).execute().data or []
+    return (created or [payload])[0]
+
+
+def _safe_wallet(row: dict[str, Any] | None) -> dict[str, Any]:
+    item = dict(row or {})
+    item["page_balance"] = int(item.get("page_balance") or 0)
+    item["total_pages_credited"] = int(item.get("total_pages_credited") or 0)
+    item["total_pages_used"] = int(item.get("total_pages_used") or 0)
+    item["status"] = (item.get("status") or "active").strip().lower()
+    return item
+
+
+def _safe_recharge_plan(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["pages"] = int(item.get("pages") or 0)
+    item["amount"] = float(item.get("amount") or 0)
+    item["validity_days"] = int(item.get("validity_days") or 365)
+    item["sort_order"] = int(item.get("sort_order") or 100)
+    item["status"] = (item.get("status") or "inactive").strip().lower()
+    return item
+
+
+def _safe_recharge_request(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["requested_pages"] = int(item.get("requested_pages") or 0)
+    item["amount"] = float(item.get("amount") or 0)
+    item["validity_days"] = int(item.get("validity_days") or 0)
+    item["proof_available"] = bool((item.get("proof_storage_key") or "").strip())
+    item.pop("proof_storage_key", None)
+    return item
+
+
+def _bank_import_payment_settings() -> dict[str, Any]:
+    rows = supabase.table("bank_import_payment_settings").select("*").eq("id", 1).limit(1).execute().data or []
+    if rows:
+        return dict(rows[0])
+    payload = {
+        "id": 1,
+        "receiver_name": "",
+        "upi_id": "",
+        "payment_note": "Payment details will be updated by Tezhisab support.",
+        "qr_image_url": "",
+    }
+    try:
+        created = supabase.table("bank_import_payment_settings").insert(payload).execute().data or []
+        return dict((created or [payload])[0])
+    except Exception:
+        return payload
+
+
+def _active_bank_import_plans() -> list[dict[str, Any]]:
+    rows = (
+        supabase.table("bank_import_recharge_plans")
+        .select("*")
+        .eq("status", "active")
+        .order("sort_order")
+        .execute()
+        .data
+        or []
+    )
+    return [_safe_recharge_plan(row) for row in rows]
+
+
+def _issue_recharge_upload_ticket(storage_key: str, email: str) -> str:
+    payload = {"storage_key": storage_key, "email": _normalize_email(email), "exp": int(time.time()) + 1800}
+    body = _b64encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+
+def _read_recharge_upload_ticket(ticket: str | None, email: str) -> dict[str, Any] | None:
+    try:
+        body, sig = (ticket or "").split(".", 1)
+        expected = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(_b64decode(body).decode())
+        if int(payload.get("exp") or 0) < int(time.time()):
+            return None
+        if _normalize_email(payload.get("email")) != _normalize_email(email):
+            return None
+        if not (payload.get("storage_key") or "").startswith("bank-import/recharge-proofs/"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _recharge_proof_ticket(data: dict[str, Any], email: str) -> tuple[dict[str, Any] | None, Any]:
+    if not _r2_is_configured():
+        return None, (
+            jsonify({
+                "success": False,
+                "message": "Payment screenshot storage is not configured yet. Submit your recharge request using UTR number without an attachment.",
+            }),
+            503,
+        )
+    try:
+        filename = _safe_recharge_screenshot_filename(data.get("filename") or "")
+        content_type = (data.get("content_type") or "application/octet-stream").strip()
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError) as exc:
+        return None, (jsonify({"success": False, "message": str(exc)}), 400)
+    if size_bytes <= 0:
+        return None, (jsonify({"success": False, "message": "Selected payment proof is empty."}), 400)
+    if size_bytes > MAX_RECHARGE_SCREENSHOT_MB * 1024 * 1024:
+        return None, (jsonify({"success": False, "message": f"Payment proof is larger than the {MAX_RECHARGE_SCREENSHOT_MB} MB limit."}), 400)
+    storage_key = _new_recharge_screenshot_storage_key(email, filename)
+    upload_url = _r2_presigned_put(storage_key, content_type)
+    return {
+        "success": True,
+        "upload_url": upload_url,
+        "storage_key": storage_key,
+        "attachment_ticket": _issue_recharge_upload_ticket(storage_key, email),
+        "headers": {"Content-Type": content_type},
+        "expires_in": R2_UPLOAD_URL_SECONDS,
+    }, None
+
+
+def _wallet_customer_or_error(auth: dict[str, Any] | None):
+    customer = _customer_for_auth(auth)
+    if not customer or not customer.get("id"):
+        return None, (jsonify({"success": False, "message": "Approved customer account not found."}), 404)
+    return customer, None
+
+
+@app.route("/customer/bank-import/wallet", methods=["GET"])
+def customer_bank_import_wallet():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    wallet = _safe_wallet(_wallet_for_customer(int(customer.get("id"))))
+    requests_rows = (
+        supabase.table("bank_import_recharge_requests")
+        .select("*")
+        .eq("customer_id", int(customer.get("id")))
+        .order("submitted_at", desc=True)
+        .limit(30)
+        .execute()
+        .data
+        or []
+    )
+    transaction_rows = (
+        supabase.table("bank_import_wallet_transactions")
+        .select("*")
+        .eq("customer_id", int(customer.get("id")))
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+        .data
+        or []
+    )
+    return jsonify({
+        "success": True,
+        "wallet": wallet,
+        "plans": _active_bank_import_plans(),
+        "payment_settings": _bank_import_payment_settings(),
+        "recharge_requests": [_safe_recharge_request(row) for row in requests_rows],
+        "transactions": transaction_rows,
+        "proof_upload_enabled": _r2_is_configured(),
+        "max_recharge_screenshot_mb": MAX_RECHARGE_SCREENSHOT_MB,
+        "privacy_note": "Tally ledgers, ledger mappings, narration groups and accounting entries are not stored in the Tezhisab cloud.",
+    })
+
+
+@app.route("/customer/bank-import/recharge/presign-upload", methods=["POST"])
+def customer_bank_import_recharge_presign_upload():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    ticket, error = _recharge_proof_ticket(request.json or {}, auth.get("email") or customer.get("email") or "")
+    return error or jsonify(ticket)
+
+
+@app.route("/customer/bank-import/recharge-requests", methods=["POST"])
+def customer_bank_import_recharge_request_create():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    data = request.json or {}
+    try:
+        plan_id = int(data.get("plan_id") or 0)
+    except Exception:
+        plan_id = 0
+    plan_rows = supabase.table("bank_import_recharge_plans").select("*").eq("id", plan_id).eq("status", "active").limit(1).execute().data or []
+    if not plan_rows:
+        return jsonify({"success": False, "message": "Select an active recharge plan."}), 400
+    plan = _safe_recharge_plan(plan_rows[0])
+    utr_number = (data.get("utr_number") or "").strip().upper()
+    if len(utr_number) < 5:
+        return jsonify({"success": False, "message": "Enter the payment UTR / transaction reference number."}), 400
+    proof_key = (data.get("proof_storage_key") or "").strip()
+    proof_ticket = _read_recharge_upload_ticket(data.get("attachment_ticket"), auth.get("email") or "") if proof_key else None
+    if proof_key and (not proof_ticket or proof_ticket.get("storage_key") != proof_key):
+        return jsonify({"success": False, "message": "Payment proof upload authorization expired. Select and upload the screenshot again."}), 400
+    payload = {
+        "customer_id": int(customer.get("id")),
+        "plan_id": int(plan.get("id")),
+        "plan_name": plan.get("plan_name") or "Recharge Plan",
+        "requested_pages": int(plan.get("pages") or 0),
+        "amount": float(plan.get("amount") or 0),
+        "validity_days": int(plan.get("validity_days") or 365),
+        "utr_number": utr_number,
+        "payment_date": (data.get("payment_date") or today_str()).strip(),
+        "customer_note": (data.get("customer_note") or "").strip(),
+        "proof_storage_key": proof_key if proof_key.startswith("bank-import/recharge-proofs/") else "",
+        "proof_filename": _safe_recharge_screenshot_filename(data.get("proof_filename")) if data.get("proof_filename") else "",
+        "proof_content_type": (data.get("proof_content_type") or "").strip(),
+        "proof_size_bytes": int(data.get("proof_size_bytes") or 0),
+        "status": "pending",
+    }
+    try:
+        created = supabase.table("bank_import_recharge_requests").insert(payload).execute().data or []
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not submit recharge request. Check whether this UTR was already submitted.", "error": str(exc)}), 400
+    _write_log("bank_import_recharge_requested", {"customer_id": customer.get("id"), "plan_id": plan_id, "pages": plan.get("pages"), "utr": utr_number}, request)
+    return jsonify({"success": True, "message": "Recharge request submitted. Pages will be added after admin approval.", "request": _safe_recharge_request((created or [payload])[0])})
+
+
+def _proof_redirect_for_request(request_id: int, auth: dict[str, Any]):
+    rows = supabase.table("bank_import_recharge_requests").select("*").eq("id", int(request_id)).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Payment proof not found."}), 404
+    item = rows[0]
+    if auth.get("role") != "admin":
+        customer = _customer_for_auth(auth)
+        if not customer or int(item.get("customer_id") or 0) != int(customer.get("id") or 0):
+            return jsonify({"success": False, "message": "This payment proof does not belong to your account."}), 403
+    key = (item.get("proof_storage_key") or "").strip()
+    if not key or not _r2_is_configured():
+        return jsonify({"success": False, "message": "Payment proof is unavailable."}), 404
+    return redirect(_r2_presigned_get(key), code=302)
+
+
+@app.route("/customer/bank-import/recharge-requests/<int:request_id>/proof", methods=["GET"])
+def customer_bank_import_recharge_proof(request_id: int):
+    auth = _portal_user_from_request(request)
+    if not auth or auth.get("role") not in ("customer", "admin"):
+        return jsonify({"success": False, "message": "Customer login required."}), 401
+    return _proof_redirect_for_request(request_id, auth)
+
+
+@app.route("/admin/bank-import/overview", methods=["GET"])
+def admin_bank_import_overview():
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    wallet_rows = supabase.table("bank_import_wallets").select("*,customers(name,email,business_name,phone)").order("updated_at", desc=True).execute().data or []
+    request_rows = supabase.table("bank_import_recharge_requests").select("*,customers(name,email,business_name,phone)").order("submitted_at", desc=True).limit(200).execute().data or []
+    plan_rows = supabase.table("bank_import_recharge_plans").select("*").order("sort_order").execute().data or []
+    wallets = []
+    for row in wallet_rows:
+        item = _safe_wallet(row)
+        item["customers"] = row.get("customers") or {}
+        wallets.append(item)
+    pending = sum(1 for row in request_rows if (row.get("status") or "pending") == "pending")
+    return jsonify({
+        "success": True,
+        "wallets": wallets,
+        "recharge_requests": [_safe_recharge_request(row) for row in request_rows],
+        "plans": [_safe_recharge_plan(row) for row in plan_rows],
+        "payment_settings": _bank_import_payment_settings(),
+        "summary": {
+            "customers_with_wallet": len(wallets),
+            "pages_remaining": sum(int(item.get("page_balance") or 0) for item in wallets),
+            "pages_credited": sum(int(item.get("total_pages_credited") or 0) for item in wallets),
+            "pending_requests": pending,
+        },
+        "proof_upload_enabled": _r2_is_configured(),
+        "max_recharge_screenshot_mb": MAX_RECHARGE_SCREENSHOT_MB,
+    })
+
+
+@app.route("/admin/bank-import/recharge-plans", methods=["POST"])
+def admin_bank_import_recharge_plan_create():
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    data = request.json or {}
+    plan_name = (data.get("plan_name") or "").strip()
+    try:
+        pages = int(data.get("pages") or 0)
+        amount = float(data.get("amount") or 0)
+        validity_days = int(data.get("validity_days") or 365)
+        sort_order = int(data.get("sort_order") or 100)
+    except Exception:
+        return jsonify({"success": False, "message": "Pages, amount, validity days and display order must be valid numbers."}), 400
+    if not plan_name or pages <= 0 or amount < 0 or validity_days <= 0:
+        return jsonify({"success": False, "message": "Plan name, positive pages and positive validity days are required."}), 400
+    payload = {"plan_name": plan_name, "pages": pages, "amount": amount, "validity_days": validity_days, "sort_order": sort_order, "status": "active" if data.get("status") == "active" else "inactive"}
+    created = supabase.table("bank_import_recharge_plans").insert(payload).execute().data or []
+    _write_log("bank_import_recharge_plan_created", payload, request)
+    return jsonify({"success": True, "message": "Recharge plan saved successfully.", "plan": _safe_recharge_plan((created or [payload])[0])})
+
+
+@app.route("/admin/bank-import/recharge-plans/<int:plan_id>/status", methods=["POST"])
+def admin_bank_import_recharge_plan_status(plan_id: int):
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    status = ((request.json or {}).get("status") or "").strip().lower()
+    if status not in {"active", "inactive"}:
+        return jsonify({"success": False, "message": "Plan status must be active or inactive."}), 400
+    supabase.table("bank_import_recharge_plans").update({"status": status, "updated_at": datetime.utcnow().isoformat() + "Z"}).eq("id", int(plan_id)).execute()
+    return jsonify({"success": True, "message": f"Recharge plan marked as {status}."})
+
+
+@app.route("/admin/bank-import/payment-settings", methods=["POST"])
+def admin_bank_import_payment_settings_save():
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    data = request.json or {}
+    payload = {
+        "id": 1,
+        "receiver_name": (data.get("receiver_name") or "").strip(),
+        "upi_id": (data.get("upi_id") or "").strip(),
+        "payment_note": (data.get("payment_note") or "").strip(),
+        "qr_image_url": (data.get("qr_image_url") or "").strip(),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    supabase.table("bank_import_payment_settings").upsert(payload, on_conflict="id").execute()
+    _write_log("bank_import_payment_settings_updated", {"receiver_name": payload["receiver_name"], "upi_id": payload["upi_id"]}, request)
+    return jsonify({"success": True, "message": "Manual payment details updated successfully.", "payment_settings": payload})
+
+
+@app.route("/admin/bank-import/recharge-requests/<int:request_id>/approve", methods=["POST"])
+def admin_bank_import_recharge_approve(request_id: int):
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    auth = _current_user(request) or {}
+    try:
+        result = supabase.rpc("approve_bank_import_recharge", {"p_request_id": int(request_id), "p_admin_email": auth.get("email") or "admin"}).execute().data or []
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not approve recharge. Run the latest Phase 4 SQL file first or check whether the request is still pending.", "error": str(exc)}), 400
+    _write_log("bank_import_recharge_approved", {"request_id": request_id}, request)
+    return jsonify({"success": True, "message": "Recharge approved. Pages have been added to the customer wallet.", "result": result})
+
+
+@app.route("/admin/bank-import/recharge-requests/<int:request_id>/reject", methods=["POST"])
+def admin_bank_import_recharge_reject(request_id: int):
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    auth = _current_user(request) or {}
+    data = request.json or {}
+    reason = (data.get("reason") or "Payment could not be verified.").strip()
+    rows = supabase.table("bank_import_recharge_requests").select("*").eq("id", int(request_id)).limit(1).execute().data or []
+    if not rows:
+        return jsonify({"success": False, "message": "Recharge request not found."}), 404
+    if (rows[0].get("status") or "pending") != "pending":
+        return jsonify({"success": False, "message": "Only pending recharge requests can be rejected."}), 400
+    supabase.table("bank_import_recharge_requests").update({"status": "rejected", "rejection_reason": reason, "reviewed_by": auth.get("email") or "admin", "reviewed_at": datetime.utcnow().isoformat() + "Z"}).eq("id", int(request_id)).execute()
+    _write_log("bank_import_recharge_rejected", {"request_id": request_id, "reason": reason}, request)
+    return jsonify({"success": True, "message": "Recharge request rejected."})
+
+
+@app.route("/admin/bank-import/recharge-requests/<int:request_id>/proof", methods=["GET"])
+def admin_bank_import_recharge_proof(request_id: int):
+    auth = _portal_user_from_request(request)
+    if not auth or auth.get("role") != "admin":
+        return jsonify({"success": False, "message": "Admin login required."}), 401
+    return _proof_redirect_for_request(request_id, auth)
+
+
+@app.route("/admin/bank-import/wallet-adjustments", methods=["POST"])
+def admin_bank_import_wallet_adjustment():
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    data = request.json or {}
+    auth = _current_user(request) or {}
+    try:
+        customer_id = int(data.get("customer_id") or 0)
+        pages_delta = int(data.get("pages_delta") or 0)
+        validity_days = int(data.get("validity_days") or 0)
+    except Exception:
+        return jsonify({"success": False, "message": "Customer, pages and validity extension must be valid numbers."}), 400
+    if not customer_id or (pages_delta == 0 and validity_days == 0):
+        return jsonify({"success": False, "message": "Select a customer and enter pages to add/remove or validity days to extend."}), 400
+    description = (data.get("description") or "Manual wallet adjustment").strip()
+    try:
+        result = supabase.rpc("adjust_bank_import_wallet", {"p_customer_id": customer_id, "p_pages_delta": pages_delta, "p_validity_days": validity_days, "p_admin_email": auth.get("email") or "admin", "p_description": description}).execute().data or []
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Could not update wallet. Run the latest Phase 4 SQL file first and ensure balance will not become negative.", "error": str(exc)}), 400
+    _write_log("bank_import_wallet_adjusted", {"customer_id": customer_id, "pages_delta": pages_delta, "validity_days": validity_days}, request)
+    return jsonify({"success": True, "message": "Customer wallet updated successfully.", "result": result})
+
 
 @app.route("/admin/activity-logs", methods=["GET"])
 def admin_activity_logs():
