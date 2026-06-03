@@ -1928,6 +1928,10 @@ def _bank_import_launch_url(ticket: str) -> str:
     base = BANK_IMPORT_WEB_APP_URL or "http://localhost:7357"
     query = urllib_parse.urlencode({
         "ticket": ticket,
+        # Customers entering from the Central Portal should land directly on
+        # the live wallet / trial-access page. All other workspace tabs remain
+        # available from the Bank Import Pro top navigation.
+        "start": "wallet",
         # Keep test and production deployments isolated automatically. The
         # Flutter app exchanges the one-time ticket with the same API host that
         # issued it.
