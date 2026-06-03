@@ -71,6 +71,12 @@ BANK_IMPORT_TEMP_R2_ENDPOINT_URL = os.environ.get("BANK_IMPORT_TEMP_R2_ENDPOINT_
 BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS = max(60, int(os.environ.get("BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS", "900")))
 BANK_IMPORT_TEMP_RETENTION_HOURS = max(1, int(os.environ.get("BANK_IMPORT_TEMP_RETENTION_HOURS", "24")))
 MAX_BANK_IMPORT_PDF_MB = max(1, int(os.environ.get("MAX_BANK_IMPORT_PDF_MB", "30")))
+# Customer portal opens the Bank Import Pro Flutter workspace in a separate
+# full-screen browser tab. During private localhost testing keep this URL as
+# http://localhost:7357. Change it to https://bankimport.tezhisab.com only
+# after the Cloudflare Pages production frontend is ready.
+BANK_IMPORT_WEB_APP_URL = os.environ.get("BANK_IMPORT_WEB_APP_URL", "http://localhost:7357").strip().rstrip("/")
+BANK_IMPORT_LAUNCH_TICKET_SECONDS = max(30, min(int(os.environ.get("BANK_IMPORT_LAUNCH_TICKET_SECONDS", "120")), 600))
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -1912,6 +1918,114 @@ def _require_customer_auth() -> tuple[dict[str, Any] | None, Any]:
     if not auth or auth.get("role") not in ("customer", "admin"):
         return None, (jsonify({"success": False, "message": "Customer login required."}), 401)
     return auth, None
+
+
+def _bank_import_launch_ticket_hash(ticket: str) -> str:
+    return hashlib.sha256((ticket or "").encode("utf-8")).hexdigest()
+
+
+def _bank_import_launch_url(ticket: str) -> str:
+    base = BANK_IMPORT_WEB_APP_URL or "http://localhost:7357"
+    query = urllib_parse.urlencode({
+        "ticket": ticket,
+        # Keep test and production deployments isolated automatically. The
+        # Flutter app exchanges the one-time ticket with the same API host that
+        # issued it.
+        "api": request.url_root.rstrip("/"),
+    })
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}{query}"
+
+
+def _safe_bank_import_launch_ticket_cleanup() -> None:
+    try:
+        supabase.table("bank_import_launch_tickets").delete().lt("expires_at", datetime.utcnow().isoformat() + "Z").execute()
+    except Exception:
+        # Cleanup is best-effort. Ticket expiry is still enforced by the atomic
+        # consume RPC.
+        pass
+
+
+@app.route("/customer/bank-import/launch-ticket", methods=["POST"])
+def customer_bank_import_launch_ticket():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    if (auth or {}).get("role") != "customer":
+        return jsonify({"success": False, "message": "Use an approved customer login to open Bank Import Pro."}), 403
+    customer = _customer_for_auth(auth)
+    if not customer:
+        return jsonify({"success": False, "message": "Approved customer profile was not found."}), 404
+
+    raw_ticket = secrets.token_urlsafe(36)
+    expires_at = datetime.utcnow() + timedelta(seconds=BANK_IMPORT_LAUNCH_TICKET_SECONDS)
+    try:
+        _safe_bank_import_launch_ticket_cleanup()
+        supabase.table("bank_import_launch_tickets").insert({
+            "ticket_hash": _bank_import_launch_ticket_hash(raw_ticket),
+            "customer_id": int(customer.get("id")),
+            "issued_to_email": _normalize_email(auth.get("email")),
+            "expires_at": expires_at.isoformat() + "Z",
+        }).execute()
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "message": "Bank Import launch setup is not ready. Run the latest V17 SQL in Supabase SQL Editor.",
+            "error": str(exc),
+        }), 500
+
+    _write_log("bank_import_web_launch_ticket_issued", {"customer_id": customer.get("id")}, request)
+    return jsonify({
+        "success": True,
+        "launch_url": _bank_import_launch_url(raw_ticket),
+        "expires_in": BANK_IMPORT_LAUNCH_TICKET_SECONDS,
+    })
+
+
+@app.route("/customer/bank-import/exchange-launch-ticket", methods=["POST"])
+def customer_bank_import_exchange_launch_ticket():
+    data = request.get_json(silent=True) or {}
+    raw_ticket = (data.get("ticket") or "").strip()
+    if not raw_ticket or len(raw_ticket) > 300:
+        return jsonify({"success": False, "message": "Bank Import launch link is invalid or has expired. Open it again from the Central Portal."}), 400
+    try:
+        consumed = supabase.rpc("consume_bank_import_launch_ticket", {
+            "p_ticket_hash": _bank_import_launch_ticket_hash(raw_ticket),
+        }).execute().data or []
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "message": "Bank Import launch setup is not ready. Run the latest V17 SQL in Supabase SQL Editor.",
+            "error": str(exc),
+        }), 500
+    if not consumed:
+        return jsonify({"success": False, "message": "Bank Import launch link is invalid, expired or already used. Open it again from the Central Portal."}), 401
+
+    ticket_row = consumed[0]
+    customer_id = int(ticket_row.get("customer_id") or 0)
+    email = _normalize_email(ticket_row.get("issued_to_email"))
+    users = supabase.table("portal_users").select("*").eq("email", email).eq("status", "active").limit(1).execute().data or []
+    portal_user = users[0] if users else None
+    if not portal_user or (portal_user.get("role") or "").lower() != "customer":
+        return jsonify({"success": False, "message": "Approved customer login is no longer active."}), 403
+    customer = _customer_for_auth({"customer_id": customer_id, "email": email})
+    if not customer or int(customer.get("id") or 0) != customer_id:
+        return jsonify({"success": False, "message": "Approved customer profile was not found."}), 404
+
+    portal_user = dict(portal_user)
+    portal_user["customer_id"] = customer_id
+    token = _issue_token(portal_user)
+    _write_log("bank_import_web_launch_ticket_consumed", {"customer_id": customer_id, "email": email})
+    return jsonify({
+        "success": True,
+        "token": token,
+        "user": {
+            "email": email,
+            "role": "customer",
+            "name": portal_user.get("display_name") or customer.get("name") or email,
+            "customer_id": customer_id,
+        },
+    })
 
 
 def _issue_requirement_upload_ticket(storage_key: str, email: str) -> str:
