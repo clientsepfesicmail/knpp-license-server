@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import string
+import tempfile
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,8 @@ from urllib import request as urllib_request
 from flask import Flask, jsonify, redirect, request, send_from_directory
 from supabase import Client, create_client
 from werkzeug.utils import secure_filename
+
+from web_statement_processor import count_pdf_pages, process_bank_statement, processor_capabilities
 
 try:
     import boto3
@@ -53,11 +56,61 @@ MAX_REQUIREMENT_UPLOAD_MB = int(os.environ.get("MAX_REQUIREMENT_UPLOAD_MB", "15"
 MAX_RECHARGE_SCREENSHOT_MB = int(os.environ.get("MAX_RECHARGE_SCREENSHOT_MB", "5"))
 ALLOWED_RECHARGE_SCREENSHOT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
 BANK_IMPORT_PRODUCT_CODE = "BIP"
+
+# Bank Import Pro temporary statement storage. This MUST use a separate R2
+# bucket from the central EXE/APK update bucket. The same R2 account or API
+# token can be reused when it has permission for both buckets, but a separate
+# token may be configured through the BANK_IMPORT_TEMP_R2_* variables.
+BANK_IMPORT_TEMP_R2_ACCOUNT_ID = os.environ.get("BANK_IMPORT_TEMP_R2_ACCOUNT_ID", R2_ACCOUNT_ID).strip()
+BANK_IMPORT_TEMP_R2_ACCESS_KEY_ID = os.environ.get("BANK_IMPORT_TEMP_R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID).strip()
+BANK_IMPORT_TEMP_R2_SECRET_ACCESS_KEY = os.environ.get("BANK_IMPORT_TEMP_R2_SECRET_ACCESS_KEY", R2_SECRET_ACCESS_KEY).strip()
+BANK_IMPORT_TEMP_R2_BUCKET_NAME = os.environ.get("BANK_IMPORT_TEMP_R2_BUCKET_NAME", "").strip()
+BANK_IMPORT_TEMP_R2_ENDPOINT_URL = os.environ.get("BANK_IMPORT_TEMP_R2_ENDPOINT_URL", "").strip() or (
+    f"https://{BANK_IMPORT_TEMP_R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if BANK_IMPORT_TEMP_R2_ACCOUNT_ID else ""
+)
+BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS = max(60, int(os.environ.get("BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS", "900")))
+BANK_IMPORT_TEMP_RETENTION_HOURS = max(1, int(os.environ.get("BANK_IMPORT_TEMP_RETENTION_HOURS", "24")))
+MAX_BANK_IMPORT_PDF_MB = max(1, int(os.environ.get("MAX_BANK_IMPORT_PDF_MB", "30")))
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
+# Flutter Web runs on a separate Cloudflare Pages domain. Allow the approved
+# Bank Import Pro frontend origins and localhost preview origins to call the
+# existing authenticated portal APIs. Set CORS_ALLOWED_ORIGINS in Render when
+# additional production/staging domains are introduced.
+CORS_ALLOWED_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        "https://tezhisab.com,https://www.tezhisab.com,https://bankimport.tezhisab.com,https://preview-bankimport.tezhisab.com",
+    ).split(",")
+    if origin.strip()
+}
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def _cors_origin_allowed(origin: str | None) -> bool:
+    value = (origin or "").strip().rstrip("/")
+    if not value:
+        return False
+    if value in CORS_ALLOWED_ORIGINS:
+        return True
+    # Keep local Flutter Chrome preview easy during development.
+    return value.startswith("http://localhost:") or value.startswith("http://127.0.0.1:")
+
+
+@app.after_request
+def _add_cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    if _cors_origin_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Max-Age"] = "86400"
+    return response
 
 DEFAULT_PRODUCTS = [
     {
@@ -224,6 +277,33 @@ def _r2_client():
     )
 
 
+def _bank_import_temp_r2_is_configured() -> bool:
+    return bool(
+        boto3
+        and BotoConfig
+        and BANK_IMPORT_TEMP_R2_ENDPOINT_URL
+        and BANK_IMPORT_TEMP_R2_ACCESS_KEY_ID
+        and BANK_IMPORT_TEMP_R2_SECRET_ACCESS_KEY
+        and BANK_IMPORT_TEMP_R2_BUCKET_NAME
+        and BANK_IMPORT_TEMP_R2_BUCKET_NAME != R2_BUCKET_NAME
+    )
+
+
+def _bank_import_temp_r2_client():
+    if not _bank_import_temp_r2_is_configured():
+        if BANK_IMPORT_TEMP_R2_BUCKET_NAME and BANK_IMPORT_TEMP_R2_BUCKET_NAME == R2_BUCKET_NAME:
+            raise RuntimeError("Bank Import temporary PDFs must use a separate R2 bucket from EXE/APK updates.")
+        raise RuntimeError("Temporary Bank Import PDF storage is not configured. Add BANK_IMPORT_TEMP_R2_BUCKET_NAME in Render first.")
+    return boto3.client(
+        service_name="s3",
+        endpoint_url=BANK_IMPORT_TEMP_R2_ENDPOINT_URL,
+        aws_access_key_id=BANK_IMPORT_TEMP_R2_ACCESS_KEY_ID,
+        aws_secret_access_key=BANK_IMPORT_TEMP_R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
 def _safe_app_filename(filename: str) -> str:
     clean = secure_filename(filename or "")
     if not clean:
@@ -264,6 +344,134 @@ def _safe_requirement_filename(filename: str) -> str:
         raise ValueError("Allowed attachments: PDF, image, Word, Excel, CSV, TXT or ZIP.")
     return clean
 
+
+
+def _safe_bank_import_pdf_filename(filename: str) -> str:
+    clean = secure_filename(filename or "")
+    if not clean:
+        raise ValueError("Select a valid PDF bank statement.")
+    if Path(clean).suffix.lower() != ".pdf":
+        raise ValueError("Only original PDF bank statements are allowed.")
+    return clean
+
+
+def _new_bank_import_temp_storage_key(customer_id: int, email: str, filename: str) -> str:
+    customer_piece = _clean_path_piece(customer_id or _normalize_email(email).replace("@", "-at-"), "customer").lower()
+    safe_name = _safe_bank_import_pdf_filename(filename)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    day_piece = datetime.utcnow().strftime("%Y/%m/%d")
+    return f"statements/{customer_piece}/{day_piece}/{stamp}_{secrets.token_hex(8)}_{safe_name}"
+
+
+def _bank_import_temp_presigned_put(storage_key: str, expires: int | None = None) -> str:
+    return _bank_import_temp_r2_client().generate_presigned_url(
+        ClientMethod="put_object",
+        Params={"Bucket": BANK_IMPORT_TEMP_R2_BUCKET_NAME, "Key": storage_key, "ContentType": "application/pdf"},
+        ExpiresIn=max(60, min(int(expires or BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS), 3600)),
+    )
+
+
+def _issue_bank_import_temp_upload_ticket(upload_id: int, storage_key: str, customer_id: int, email: str, size_bytes: int) -> str:
+    payload = {
+        "upload_id": int(upload_id),
+        "storage_key": storage_key,
+        "customer_id": int(customer_id),
+        "email": _normalize_email(email),
+        "size_bytes": int(size_bytes),
+        "exp": int(time.time()) + BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS,
+    }
+    body = _b64encode(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+
+def _read_bank_import_temp_upload_ticket(ticket: str | None, customer_id: int, email: str) -> dict[str, Any] | None:
+    try:
+        body, sig = (ticket or "").split(".", 1)
+        expected = _b64encode(hmac.new(SERVER_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(_b64decode(body).decode())
+        if int(payload.get("exp") or 0) < int(time.time()):
+            return None
+        if int(payload.get("customer_id") or 0) != int(customer_id):
+            return None
+        if _normalize_email(payload.get("email")) != _normalize_email(email):
+            return None
+        if not (payload.get("storage_key") or "").startswith("statements/"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _delete_bank_import_temp_object(storage_key: str) -> tuple[bool, str]:
+    key = (storage_key or "").strip()
+    if not key.startswith("statements/"):
+        return False, "Invalid temporary statement storage key."
+    try:
+        _bank_import_temp_r2_client().delete_object(Bucket=BANK_IMPORT_TEMP_R2_BUCKET_NAME, Key=key)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _safe_bank_import_temp_upload(row: dict[str, Any] | None) -> dict[str, Any]:
+    item = dict(row or {})
+    return {
+        "id": item.get("id"),
+        "filename": item.get("original_filename") or "Bank statement.pdf",
+        "content_type": item.get("content_type") or "application/pdf",
+        "size_bytes": int(item.get("size_bytes") or 0),
+        "status": item.get("status") or "unknown",
+        "created_at": item.get("created_at"),
+        "uploaded_at": item.get("uploaded_at"),
+        "deleted_at": item.get("deleted_at"),
+        "expires_at": item.get("expires_at"),
+        "page_count": int(item.get("page_count") or 0),
+        "wallet_pages_reserved": int(item.get("wallet_pages_reserved") or 0),
+        "wallet_pages_charged": int(item.get("wallet_pages_charged") or 0),
+    }
+
+
+def _cleanup_expired_bank_import_temp_uploads(limit: int = 30) -> dict[str, Any]:
+    result: dict[str, Any] = {"checked": 0, "deleted": 0, "failed": 0, "reservations_released": 0}
+    if not _bank_import_temp_r2_is_configured():
+        result["message"] = "Temporary Bank Import PDF storage is not configured."
+        return result
+    try:
+        rows = (
+            supabase.table("bank_import_temp_uploads")
+            .select("*")
+            .in_("status", ["upload_url_created", "uploaded", "processing", "failed"])
+            .lt("expires_at", datetime.utcnow().isoformat())
+            .order("expires_at")
+            .limit(max(1, min(int(limit), 200)))
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        result["message"] = str(exc)
+        return result
+    for row in rows:
+        result["checked"] += 1
+        reservation_id = int(row.get("reservation_id") or 0)
+        if reservation_id:
+            released, _ = _release_bank_import_reservation(reservation_id, "Temporary PDF expired before processing completed.")
+            if released:
+                result["reservations_released"] += 1
+        ok, error = _delete_bank_import_temp_object(row.get("storage_key") or "")
+        payload = {"status": "expired", "deleted_at": datetime.utcnow().isoformat()} if ok else {"status": "failed", "failure_reason": error[:500]}
+        try:
+            supabase.table("bank_import_temp_uploads").update(payload).eq("id", int(row.get("id") or 0)).execute()
+        except Exception:
+            pass
+        if ok:
+            result["deleted"] += 1
+        else:
+            result["failed"] += 1
+    return result
 
 
 def _safe_recharge_screenshot_filename(filename: str) -> str:
@@ -2069,6 +2277,7 @@ def _wallet_for_customer(customer_id: int, create_if_missing: bool = True) -> di
     payload = {
         "customer_id": int(customer_id),
         "page_balance": 0,
+        "reserved_pages": 0,
         "total_pages_credited": 0,
         "total_pages_used": 0,
         "status": "active",
@@ -2080,10 +2289,45 @@ def _wallet_for_customer(customer_id: int, create_if_missing: bool = True) -> di
 def _safe_wallet(row: dict[str, Any] | None) -> dict[str, Any]:
     item = dict(row or {})
     item["page_balance"] = int(item.get("page_balance") or 0)
+    item["reserved_pages"] = max(0, int(item.get("reserved_pages") or 0))
+    item["available_pages"] = max(0, item["page_balance"] - item["reserved_pages"])
     item["total_pages_credited"] = int(item.get("total_pages_credited") or 0)
     item["total_pages_used"] = int(item.get("total_pages_used") or 0)
     item["status"] = (item.get("status") or "active").strip().lower()
     return item
+
+
+def _rpc_first(value: Any) -> dict[str, Any]:
+    """Return the first Supabase RPC row without trusting the wire shape."""
+    rows = value or []
+    if isinstance(rows, dict):
+        return dict(rows)
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return dict(rows[0])
+    return {}
+
+
+def _release_bank_import_reservation(reservation_id: int | None, reason: str) -> tuple[bool, str]:
+    """Release a held page reservation. This is intentionally idempotent."""
+    try:
+        numeric_id = int(reservation_id or 0)
+    except Exception:
+        numeric_id = 0
+    if numeric_id <= 0:
+        return False, ""
+    try:
+        result = supabase.rpc(
+            "release_bank_import_pages",
+            {
+                "p_reservation_id": numeric_id,
+                "p_reason": (reason or "Processing did not complete.")[:500],
+                "p_created_by": "processing-api",
+            },
+        ).execute().data
+        released = _rpc_first(result)
+        return bool(released.get("released") or released.get("was_released")), ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _safe_recharge_plan(row: dict[str, Any]) -> dict[str, Any]:
@@ -2198,6 +2442,435 @@ def _wallet_customer_or_error(auth: dict[str, Any] | None):
     if not customer or not customer.get("id"):
         return None, (jsonify({"success": False, "message": "Approved customer account not found."}), 404)
     return customer, None
+
+
+@app.route("/customer/bank-import/temp-storage/status", methods=["GET"])
+def customer_bank_import_temp_storage_status():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    configured = _bank_import_temp_r2_is_configured()
+    same_bucket = bool(BANK_IMPORT_TEMP_R2_BUCKET_NAME and BANK_IMPORT_TEMP_R2_BUCKET_NAME == R2_BUCKET_NAME)
+    return jsonify({
+        "success": True,
+        "configured": configured,
+        "same_bucket_error": same_bucket,
+        "max_pdf_mb": MAX_BANK_IMPORT_PDF_MB,
+        "upload_url_seconds": BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS,
+        "retention_hours": BANK_IMPORT_TEMP_RETENTION_HOURS,
+        "message": (
+            "Temporary PDF storage is ready."
+            if configured
+            else "Create the separate tezhisab-bank-import-temp R2 bucket and add BANK_IMPORT_TEMP_R2_BUCKET_NAME in Render."
+        ),
+    })
+
+
+@app.route("/customer/bank-import/statements/presign-upload", methods=["POST"])
+def customer_bank_import_statement_presign_upload():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    if not _bank_import_temp_r2_is_configured():
+        return jsonify({
+            "success": False,
+            "message": "Temporary PDF storage is not configured. Create a separate tezhisab-bank-import-temp R2 bucket and add BANK_IMPORT_TEMP_R2_BUCKET_NAME in Render.",
+        }), 503
+    _cleanup_expired_bank_import_temp_uploads(limit=10)
+    data = request.json or {}
+    try:
+        filename = _safe_bank_import_pdf_filename(data.get("filename") or "")
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"success": False, "message": str(exc)}), 400
+    if size_bytes <= 0:
+        return jsonify({"success": False, "message": "Selected PDF statement is empty."}), 400
+    if size_bytes > MAX_BANK_IMPORT_PDF_MB * 1024 * 1024:
+        return jsonify({"success": False, "message": f"PDF statement is larger than the configured {MAX_BANK_IMPORT_PDF_MB} MB limit."}), 400
+    email = auth.get("email") or customer.get("email") or ""
+    customer_id = int(customer.get("id"))
+    storage_key = _new_bank_import_temp_storage_key(customer_id, email, filename)
+    expires_at = (datetime.utcnow() + timedelta(hours=BANK_IMPORT_TEMP_RETENTION_HOURS)).isoformat()
+    payload = {
+        "customer_id": customer_id,
+        "uploaded_by_email": _normalize_email(email),
+        "storage_key": storage_key,
+        "original_filename": filename,
+        "content_type": "application/pdf",
+        "size_bytes": size_bytes,
+        "status": "upload_url_created",
+        "expires_at": expires_at,
+    }
+    try:
+        created = supabase.table("bank_import_temp_uploads").insert(payload).execute().data or []
+        row = (created or [None])[0]
+        if not row or not row.get("id"):
+            raise RuntimeError("Temporary upload record was not created.")
+        upload_url = _bank_import_temp_presigned_put(storage_key)
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "message": "Could not prepare secure temporary PDF upload. Run the latest V16 Supabase SQL and verify the temporary R2 bucket settings.",
+            "error": str(exc),
+        }), 500
+    ticket = _issue_bank_import_temp_upload_ticket(int(row.get("id")), storage_key, customer_id, email, size_bytes)
+    _write_log("bank_import_temp_pdf_upload_url_created", {"upload_id": row.get("id"), "customer_id": customer_id, "size_bytes": size_bytes}, request)
+    return jsonify({
+        "success": True,
+        "upload_id": row.get("id"),
+        "upload_url": upload_url,
+        "upload_ticket": ticket,
+        "headers": {"Content-Type": "application/pdf"},
+        "expires_in": BANK_IMPORT_TEMP_UPLOAD_URL_SECONDS,
+        "retention_hours": BANK_IMPORT_TEMP_RETENTION_HOURS,
+        "max_pdf_mb": MAX_BANK_IMPORT_PDF_MB,
+        "message": "Secure temporary upload URL created.",
+    })
+
+
+@app.route("/customer/bank-import/statements/confirm-upload", methods=["POST"])
+def customer_bank_import_statement_confirm_upload():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    data = request.json or {}
+    try:
+        upload_id = int(data.get("upload_id") or 0)
+    except Exception:
+        upload_id = 0
+    customer_id = int(customer.get("id"))
+    email = auth.get("email") or customer.get("email") or ""
+    ticket = _read_bank_import_temp_upload_ticket(data.get("upload_ticket"), customer_id, email)
+    if not upload_id or not ticket or int(ticket.get("upload_id") or 0) != upload_id:
+        return jsonify({"success": False, "message": "Temporary upload authorization expired. Select the PDF statement again."}), 400
+    rows = (
+        supabase.table("bank_import_temp_uploads")
+        .select("*")
+        .eq("id", upload_id)
+        .eq("customer_id", customer_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    row = (rows or [None])[0]
+    if not row or row.get("storage_key") != ticket.get("storage_key"):
+        return jsonify({"success": False, "message": "Temporary PDF upload record was not found."}), 404
+    if (row.get("status") or "") not in {"upload_url_created", "uploaded"}:
+        return jsonify({"success": False, "message": "This temporary PDF upload is no longer active."}), 400
+    try:
+        head = _bank_import_temp_r2_client().head_object(Bucket=BANK_IMPORT_TEMP_R2_BUCKET_NAME, Key=row.get("storage_key"))
+        actual_size = int(head.get("ContentLength") or 0)
+        if actual_size != int(row.get("size_bytes") or 0) or actual_size != int(ticket.get("size_bytes") or 0):
+            _delete_bank_import_temp_object(row.get("storage_key") or "")
+            supabase.table("bank_import_temp_uploads").update({"status": "failed", "failure_reason": "Uploaded PDF size verification failed.", "deleted_at": datetime.utcnow().isoformat()}).eq("id", upload_id).execute()
+            return jsonify({"success": False, "message": "Uploaded PDF size verification failed. Select the statement again."}), 400
+        actual_type = (head.get("ContentType") or "application/pdf").split(";", 1)[0].strip().lower()
+        if actual_type != "application/pdf":
+            _delete_bank_import_temp_object(row.get("storage_key") or "")
+            supabase.table("bank_import_temp_uploads").update({"status": "failed", "failure_reason": "Uploaded file was not a PDF.", "deleted_at": datetime.utcnow().isoformat()}).eq("id", upload_id).execute()
+            return jsonify({"success": False, "message": "Only PDF bank statements are allowed."}), 400
+        updated = (
+            supabase.table("bank_import_temp_uploads")
+            .update({"status": "uploaded", "uploaded_at": datetime.utcnow().isoformat()})
+            .eq("id", upload_id)
+            .execute()
+            .data
+            or []
+        )
+        row = (updated or [row])[0]
+    except Exception as exc:
+        return jsonify({"success": False, "message": "Uploaded PDF could not be verified in temporary cloud storage.", "error": str(exc)}), 400
+    _write_log("bank_import_temp_pdf_uploaded", {"upload_id": upload_id, "customer_id": customer_id, "size_bytes": row.get("size_bytes")}, request)
+    return jsonify({
+        "success": True,
+        "upload": _safe_bank_import_temp_upload(row),
+        "message": "PDF uploaded securely. It will be deleted automatically after processing.",
+    })
+
+
+@app.route("/customer/bank-import/processing/status", methods=["GET"])
+def customer_bank_import_processing_status():
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    return jsonify({
+        "success": True,
+        "temporary_storage_ready": _bank_import_temp_r2_is_configured(),
+        "processor": processor_capabilities(),
+        "wallet": _safe_wallet(_wallet_for_customer(int(customer.get("id")))),
+        "wallet_deduction_enabled": True,
+        "message": "Phase 4 wallet protection is ready: pages are reserved before extraction, deducted only after success and released automatically after failure.",
+    })
+
+
+@app.route("/customer/bank-import/statements/<int:upload_id>/process", methods=["POST"])
+def customer_bank_import_statement_process(upload_id: int):
+    """Process a verified temporary PDF and charge wallet pages only after success.
+
+    Phase 4 rules:
+    - Count actual PDF pages after secure download.
+    - Reserve those pages atomically before extraction, blocking concurrent spend.
+    - Deduct wallet pages only after successful extraction and metadata save.
+    - Release held pages automatically on every processing failure.
+    - Return preview rows to the browser without persisting accounting entries.
+    """
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    if not _bank_import_temp_r2_is_configured():
+        return jsonify({"success": False, "message": "Temporary PDF storage is not configured on the server."}), 503
+
+    customer_id = int(customer.get("id"))
+    rows = (
+        supabase.table("bank_import_temp_uploads")
+        .select("*")
+        .eq("id", int(upload_id))
+        .eq("customer_id", customer_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    row = (rows or [None])[0]
+    if not row:
+        return jsonify({"success": False, "message": "Temporary PDF upload record was not found."}), 404
+    if (row.get("status") or "") != "uploaded":
+        return jsonify({
+            "success": False,
+            "message": "This PDF is no longer available for processing. Upload and verify the statement again. Duplicate processing is blocked.",
+        }), 409
+
+    data = request.json or {}
+    password = str(data.get("password") or "")[:200]
+    requested_bank = str(data.get("bank") or "AUTO")[:60]
+    storage_key = str(row.get("storage_key") or "")
+    deleted_from_r2 = False
+    cleanup_warning = ""
+    processor_result: dict[str, Any] | None = None
+    failure_message = ""
+    reservation_id = 0
+    reserved_pages = 0
+    rollback_released = False
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="bank-import-") as temp_dir:
+            local_pdf = str(Path(temp_dir) / "statement.pdf")
+            _bank_import_temp_r2_client().download_file(BANK_IMPORT_TEMP_R2_BUCKET_NAME, storage_key, local_pdf)
+            actual_pages = int(count_pdf_pages(local_pdf, password=password) or 0)
+            if actual_pages <= 0:
+                raise RuntimeError("No readable pages were found in this PDF statement.")
+
+            try:
+                reservation = _rpc_first(
+                    supabase.rpc(
+                        "reserve_bank_import_pages",
+                        {
+                            "p_customer_id": customer_id,
+                            "p_upload_id": int(upload_id),
+                            "p_pages": actual_pages,
+                            "p_created_by": auth.get("email") or "customer",
+                        },
+                    ).execute().data
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Wallet page reservation failed. Ensure that sufficient valid pages are available and run the latest V16 Supabase SQL before testing. "
+                    + str(exc)
+                ) from exc
+            reservation_id = int(reservation.get("reservation_id") or 0)
+            reserved_pages = int(reservation.get("pages_reserved") or actual_pages)
+            if reservation_id <= 0:
+                raise RuntimeError("Wallet reservation ID was not created. Run the latest V16 Supabase SQL and process again.")
+
+            processor_result = process_bank_statement(local_pdf, password=password, bank=requested_bank)
+    except Exception as exc:
+        failure_message = str(exc).strip() or f"PDF processing failed: {type(exc).__name__}"
+    finally:
+        deleted_from_r2, delete_error = _delete_bank_import_temp_object(storage_key)
+        if not deleted_from_r2 and delete_error:
+            cleanup_warning = "Temporary PDF cleanup could not be confirmed; the R2 one-day lifecycle rule will remove it automatically."
+
+    if failure_message or not processor_result:
+        if reservation_id:
+            rollback_released, rollback_error = _release_bank_import_reservation(reservation_id, failure_message or "PDF processing failed.")
+            if rollback_error:
+                failure_message += (" " if failure_message else "") + "Wallet rollback could not be confirmed automatically. Contact support before processing another statement."
+        if cleanup_warning:
+            failure_message += (" " if failure_message else "") + cleanup_warning
+        try:
+            supabase.table("bank_import_temp_uploads").update({
+                "status": "failed",
+                "failure_reason": failure_message[:1000],
+                "deleted_at": datetime.utcnow().isoformat() if deleted_from_r2 else None,
+            }).eq("id", int(upload_id)).execute()
+        except Exception:
+            pass
+        wallet = _safe_wallet(_wallet_for_customer(customer_id))
+        _write_log("bank_import_pdf_processing_failed", {
+            "upload_id": int(upload_id),
+            "customer_id": customer_id,
+            "pdf_deleted": deleted_from_r2,
+            "reservation_id": reservation_id,
+            "wallet_rollback_released": rollback_released,
+            "error": failure_message[:500],
+        }, request)
+        return jsonify({
+            "success": False,
+            "message": failure_message,
+            "pdf_deleted": deleted_from_r2,
+            "wallet_rollback_released": rollback_released,
+            "wallet": wallet,
+        }), 400
+
+    transactions = list(processor_result.pop("transactions", []) or [])
+    processed_at = datetime.utcnow().isoformat()
+    metadata = {
+        # Final wallet RPC changes this to processed atomically with deduction.
+        "status": "processing",
+        "deleted_at": processed_at if deleted_from_r2 else None,
+        "page_count": int(processor_result.get("page_count") or reserved_pages),
+        "bank_name": str(processor_result.get("bank") or "UNKNOWN")[:120],
+        "extraction_mode": str(processor_result.get("extraction_mode") or "digital")[:30],
+        "transaction_count": int(processor_result.get("total") or len(transactions)),
+        "processing_summary": {
+            "duplicates_detected": int(processor_result.get("duplicates_detected") or 0),
+            "review_count": int(processor_result.get("review_count") or 0),
+            "balance_mismatch_count": int(processor_result.get("balance_mismatch_count") or 0),
+            "ocr_confidence": float(processor_result.get("ocr_confidence") or 0),
+            "pdf_deleted": deleted_from_r2,
+            "wallet_pages_reserved": reserved_pages,
+        },
+    }
+    try:
+        supabase.table("bank_import_temp_uploads").update(metadata).eq("id", int(upload_id)).execute()
+        wallet_result = _rpc_first(
+            supabase.rpc(
+                "finalize_bank_import_pages",
+                {
+                    "p_reservation_id": reservation_id,
+                    "p_created_by": auth.get("email") or "customer",
+                    "p_description": f"Processed bank statement: {reserved_pages} page(s)",
+                },
+            ).execute().data
+        )
+        if not wallet_result:
+            raise RuntimeError("Wallet deduction confirmation was not returned.")
+    except Exception as exc:
+        rollback_released, rollback_error = _release_bank_import_reservation(reservation_id, "Final wallet deduction could not be completed.")
+        message = "Transactions were extracted, but final wallet deduction could not be completed. The held pages were released; upload and process the statement again."
+        if rollback_error:
+            message += " Automatic rollback could not be confirmed. Contact support before processing another statement."
+        if cleanup_warning:
+            message += " " + cleanup_warning
+        try:
+            supabase.table("bank_import_temp_uploads").update({
+                "status": "failed",
+                "failure_reason": (message + " " + str(exc))[:1000],
+            }).eq("id", int(upload_id)).execute()
+        except Exception:
+            pass
+        return jsonify({
+            "success": False,
+            "message": message,
+            "error": str(exc),
+            "pdf_deleted": deleted_from_r2,
+            "wallet_rollback_released": rollback_released,
+            "wallet": _safe_wallet(_wallet_for_customer(customer_id)),
+        }), 500
+
+    wallet = _safe_wallet(_wallet_for_customer(customer_id))
+    _write_log("bank_import_pdf_processed", {
+        "upload_id": int(upload_id),
+        "customer_id": customer_id,
+        "page_count": metadata["page_count"],
+        "bank_name": metadata["bank_name"],
+        "extraction_mode": metadata["extraction_mode"],
+        "transaction_count": metadata["transaction_count"],
+        "pdf_deleted": deleted_from_r2,
+        "reservation_id": reservation_id,
+        "wallet_pages_deducted": reserved_pages,
+    }, request)
+    message = str(processor_result.get("message") or "PDF processed successfully.")
+    if cleanup_warning:
+        message += " " + cleanup_warning
+    return jsonify({
+        "success": True,
+        "processing": processor_result,
+        "transactions": transactions,
+        "pdf_deleted": deleted_from_r2,
+        "wallet_deducted": True,
+        "pages_deducted": reserved_pages,
+        "wallet": wallet,
+        "message": message,
+    })
+
+
+@app.route("/customer/bank-import/statements/<int:upload_id>", methods=["DELETE"])
+def customer_bank_import_statement_delete(upload_id: int):
+    auth, denied = _require_customer_auth()
+    if denied:
+        return denied
+    customer, error = _wallet_customer_or_error(auth)
+    if error:
+        return error
+    customer_id = int(customer.get("id"))
+    rows = (
+        supabase.table("bank_import_temp_uploads")
+        .select("*")
+        .eq("id", int(upload_id))
+        .eq("customer_id", customer_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    row = (rows or [None])[0]
+    if not row:
+        return jsonify({"success": True, "message": "Temporary PDF was already removed."})
+    if (row.get("status") or "") in {"deleted", "expired"}:
+        return jsonify({"success": True, "message": "Temporary PDF was already removed."})
+    if (row.get("status") or "") == "processing":
+        return jsonify({"success": False, "message": "Processing is already running. Wait for the result before removing this PDF."}), 409
+    reservation_id = int(row.get("reservation_id") or 0)
+    if reservation_id:
+        _release_bank_import_reservation(reservation_id, "Customer removed temporary PDF before processing completed.")
+    ok, cloud_error = _delete_bank_import_temp_object(row.get("storage_key") or "")
+    if not ok:
+        return jsonify({"success": False, "message": "Temporary PDF could not be removed from cloud storage.", "error": cloud_error}), 500
+    supabase.table("bank_import_temp_uploads").update({"status": "deleted", "deleted_at": datetime.utcnow().isoformat()}).eq("id", int(upload_id)).execute()
+    _write_log("bank_import_temp_pdf_deleted", {"upload_id": int(upload_id), "customer_id": customer_id}, request)
+    return jsonify({"success": True, "message": "Temporary PDF deleted from cloud storage."})
+
+
+@app.route("/admin/bank-import/temp-storage/cleanup", methods=["POST"])
+def admin_bank_import_temp_storage_cleanup():
+    denied = _require_admin_json()
+    if denied:
+        return denied
+    data = request.json or {}
+    try:
+        limit = int(data.get("limit") or 100)
+    except Exception:
+        limit = 100
+    result = _cleanup_expired_bank_import_temp_uploads(limit=limit)
+    _write_log("bank_import_temp_storage_cleanup", result, request)
+    return jsonify({"success": True, "cleanup": result})
 
 
 @app.route("/customer/bank-import/wallet", methods=["GET"])
